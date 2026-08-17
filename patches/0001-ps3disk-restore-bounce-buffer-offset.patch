@@ -1,0 +1,33 @@
+From: René Rebe <rene@exactcode.de>
+Subject: [PATCH 1/2] ps3disk: restore bounce buffer offset increment
+
+Commit 6e0a48552b8c ("ps3disk: use memcpy_{from,to}_bvec") converted the
+scatter/gather helper to the newer bvec accessors and lost the offset
+increment in the process. Every bio vector in a multi-segment request is
+therefore copied to or from the start of the bounce buffer, corrupting all
+but the first.
+
+Single-segment requests are unaffected, so the superblock and small reads
+succeed while anything larger returns repeated data. On ext4 this surfaces
+as group descriptor and block bitmap inconsistencies, and as binaries that
+exist on disk but fail to execute with varying errno between boots.
+
+Fixes: 6e0a48552b8c ("ps3disk: use memcpy_{from,to}_bvec")
+
+Applied here against 6.4. Upstream version posted to linux-block in
+November 2025 and reviewed by Christoph Hellwig.
+---
+ drivers/block/ps3disk.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/drivers/block/ps3disk.c
++++ b/drivers/block/ps3disk.c
+@@ -84,6 +84,8 @@ static void ps3disk_scatter_gather(struct ps3_storage_device *dev,
+ 			memcpy_from_bvec(dev->bounce_buf + offset, &bvec);
+ 		else
+ 			memcpy_to_bvec(&bvec, dev->bounce_buf + offset);
++
++		offset += bvec.bv_len;
+ 	}
+ }
+ 

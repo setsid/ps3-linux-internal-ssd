@@ -1,0 +1,7 @@
+*.img
+*.img.gz
+*.tgz
+*.orig
+*-out.txt
+vmlinux
+vmlinux-stripped
