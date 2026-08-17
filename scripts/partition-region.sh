@@ -1,6 +1,6 @@
 #!/bin/sh
 # Partition the OtherOS region. Runs at the petitboot shell.
-#   sh /tmp/*/mnt/*/partition-region.sh
+#   sh /tmp/petitboot/mnt/sda1/partition-region.sh
 #
 # Destroys everything on ps3dd1 and ps3dd2.
 #
@@ -24,6 +24,13 @@ SWAP_START=37748736
 SWAP_END=46137286       # end of usable space
 
 {
+echo "=== paths ==="
+# Enumeration order is not guaranteed once other USB devices are attached, so
+# print what this actually resolved to rather than assuming sda1.
+echo "stick:  $HERE"
+echo "target: $DEV"
+
+echo
 echo "=== before ==="
 grep ps3dd /proc/partitions
 
@@ -61,6 +68,14 @@ echo ok > "$STAMP"
 
 mount -o remount,rw "$HERE" 2>/dev/null
 cp /tmp/partition-out.txt "$HERE/partition-out.txt" 2>/dev/null
+
+# Cumulative session log. The per-script files above are overwritten on every
+# run; a session spans both scripts, so append here to keep it readable as one.
+{
+    echo
+    echo "===== partition  $(date 2>/dev/null || echo 'no clock') ====="
+    cat /tmp/partition-out.txt
+} >> "$HERE/petitboot-log.txt" 2>/dev/null
 sync
 
 if [ ! -f "$STAMP" ]; then

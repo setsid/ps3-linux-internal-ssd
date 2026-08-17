@@ -140,6 +140,41 @@ build so the paths match. Read the expected name with `make -s kernelrelease`
 rather than guessing it, and include any trailing `+`. See
 [kernel-config.md](kernel-config.md).
 
+**`Warning: fsck not present, so skipping root file system` on every boot.**
+Root is never checked. The cause is at initrd build time, where `mkinitramfs`
+prints:
+
+```
+W: Couldn't identify type of root file system 'LABEL=ps3root' for fsck hook
+```
+
+`mkinitramfs` works out which `fsck` binary to include by resolving the root
+device from `/etc/fstab` and asking what filesystem is on it. Run inside a
+chroot on the build host, `LABEL=ps3root` resolves to nothing — that label
+exists only on the console — so it cannot determine the type and leaves the
+hook out.
+
+There is no `mkinitramfs` option to name the root device; the resolution comes
+from `fstab`, so building from the chroot cannot fix it without putting a
+device path in `fstab`, which is the thing this setup deliberately avoids.
+Regenerating the initrd on the console, where the label does resolve, should
+produce one with the hook included:
+
+```
+update-initramfs -u
+```
+
+**Not verified** — the dry run did not test it, and the machine boots fine
+without it. The practical impact is that a dirty unmount is never repaired
+automatically; run `fsck` from petitboot if you suspect damage. Left documented
+rather than worked around, because a silently missing fsck is worse than a known
+one.
+
+**`W: Kernel configuration /boot/config-<release> is missing`.** `modules_install`
+does not place the kernel `.config`, so `mkinitramfs` cannot check for
+`CONFIG_RD_ZSTD` and assumes it is available. Harmless — it only affects a
+capability check. README step 4 copies the config in to silence it.
+
 ## Network and apt
 
 **apt hangs or crawls on the `Packages` index.** Observed on the console:
@@ -212,10 +247,8 @@ before trusting one unattended.
 | `kernel-config.sh` | Run. Produces the config that boots. |
 | `build-image.sh` | Run. Produced the image now on the console. |
 | `partition-region.sh` | Run. Produced the current partition table. |
-| `write-image.sh` | **Generic form of a verified procedure.** Every write during development used an ad-hoc variant with the hash written into the script. The sequence — unmount, plain-redirect gunzip, sync, md5 against the source, then mount and inspect — is exactly what worked, and the log of one such run is what the content checks are modelled on. This file in that parameterised shape has not itself been run. |
-| `build-rootfs.sh` | **Not run.** Written after the fact to make the README followable from a clean machine. The tree it produces is modelled on the one that boots, but it has not built one end to end. |
+| `write-image.sh` | Run. Wrote and verified the image on the console. |
+| `build-rootfs.sh` | Run. Built the tree that boots, from a clean machine. |
 
-Neither of the two unrun scripts can damage the console on its own:
-`build-rootfs.sh` only touches a directory on the build machine, and
-`write-image.sh` stops before the content check if the md5 does not match. The
-risk is wasted cycles, not data.
+All of them have now run on hardware in the sequence the README describes, in a
+single dry run that went from nothing to booting Debian.

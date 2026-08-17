@@ -44,6 +44,19 @@ Every command below runs from the root of this repository, so script paths are
 relative to it. `~/ps3-linux` is the kernel tree from step 1 — adjust it
 throughout if you clone somewhere else.
 
+**Steps 0 and 1–3 are independent tracks.** One builds a Debian userland, the
+other builds a kernel. They share nothing and can run in either order, or at
+the same time. They meet at step 4, which puts the kernel into the tree:
+
+```
+  userland   0 ────────────────┐
+                               ├──> 4 ─> 5 ─> 6 ─> 7 ─> 8 ─> 9
+  kernel     1 ─> 2 ─> 3 ──────┘
+```
+
+If the kernel is already built, skip 1 to 3 entirely. If the tree already
+exists, skip 0.
+
 **0. Build the Debian root filesystem.** *(once)*
 
 ```
@@ -60,15 +73,29 @@ step 4, which is the one place in this sequence that installs a kernel. It
 depends on nothing above it, so it can run before, after or alongside steps 1
 to 3.
 
-**This step has not been run end to end.** It was written after the fact so the
-sequence is followable from a clean machine; steps 1 to 9 are the ones that
-were executed. It is modelled on the tree that boots, but treat it as untested
-and check its output before relying on it.
+Takes about 20 minutes under emulation on an 8-core host, most of it
+debootstrap running package scripts for a big-endian PowerPC target. The
+resulting tree is around 721 MB.
 
 **You set your own passwords.** The script prompts twice during the run, once
 for root and once for the user it creates. **This repository ships no
-credentials of any kind** — no passwords, no keys, no accounts. Nothing you
-install here inherits anyone else's, and nothing is defaulted.
+credentials of any kind** — no passwords, no keys, no accounts, and no SSH host
+or user keys. Nothing you install here inherits anyone else's, and nothing is
+defaulted.
+
+**SSH is enabled and the machine comes up reachable.** `ssh.service` is on and
+`systemd-networkd` takes a DHCP address as `eth0`, so after first boot you can
+log in over the network rather than hunting for a television and a keyboard.
+
+That also means the box is exposed on your LAN from first boot. Debian's `sshd`
+permits password authentication for normal users, so a weak password is the
+whole of the exposure. Once you are in, install a key and turn passwords off:
+
+```
+ssh-copy-id <user>@<address>
+# then in /etc/ssh/sshd_config
+PasswordAuthentication no
+```
 
 **1. Get the kernel source.** *(once)*
 
@@ -129,6 +156,7 @@ powerpc64-linux-gnu-strip -s -o /tmp/vmlinux-stripped ~/ps3-linux/vmlinux
 sudo cp /tmp/vmlinux-stripped /srv/ps3root/boot/vmlinux
 sudo make -C ~/ps3-linux ARCH=powerpc CROSS_COMPILE=powerpc64-linux-gnu- \
     INSTALL_MOD_PATH=/srv/ps3root modules_install
+sudo cp ~/ps3-linux/.config /srv/ps3root/boot/config-<kernel release>
 sudo chroot /srv/ps3root mkinitramfs -o /boot/initrd.img <kernel release>
 ```
 
@@ -149,6 +177,10 @@ directory name. On the console here `uname -r` reports
 `6.4.0-g98ec4e7cee0f+`, with the plus, and that is the directory name under
 `/lib/modules`. `ls /srv/ps3root/lib/modules` after `modules_install` is the
 check that settles it.
+
+The `.config` copy is not strictly required — `modules_install` does not place
+it, and without it `mkinitramfs` warns that it cannot check for `CONFIG_RD_ZSTD`
+and assumes it is available. One line here and the warning goes away.
 
 The initrd has to be regenerated on every kernel rebuild, alongside the
 `vmlinux` copy. Miss it and step 5 packages a new kernel with an initrd built
@@ -183,8 +215,9 @@ hours, and it fails at `run-init` rather than at build time.
 Build on the host, not on the console: petitboot's `mke2fs` is from 2010 and
 writes group descriptors the 6.4 ext4 driver rejects outright.
 
-1048576 blocks of 4 KiB is 4 GiB. The region holds 18 GiB, but 4 is enough for
-a 1.4 GiB tree and it quarters both the write and the verify. Grow it later
+1048576 blocks of 4 KiB is 4 GiB. The region holds 18 GiB, but 4 is ample — the
+tree is around 721 MB and the finished filesystem uses 875 MB — and it quarters
+both the write and the verify. Grow it later
 from inside Debian with `resize2fs`.
 
 `scripts/build-image.sh` is the same sequence scripted, with an `e2fsck` pass
@@ -203,6 +236,12 @@ sudo umount /mnt/stick
 The two petitboot scripts go on the stick alongside the image — steps 7 and 8
 run them from there.
 
+Put the stick in the **rightmost USB port on the front of the console**. That
+gives `sda1` consistently on a CECH-2503B regardless of what else is attached,
+which is what makes the paths in steps 7 and 8 predictable. Enumeration order
+is not guaranteed in general, so both scripts print the path they actually
+resolved to as their first output — check it if anything looks wrong.
+
 `gzip -1` deliberately. The image is mostly zeroes, so it comes out around
 525 MB at any level, and `-1` is much faster. `drvfs` is the WSL driver for
 mounting a Windows drive letter; on a native Linux host, mount the stick
@@ -211,7 +250,7 @@ however you normally would.
 **7. Partition the OtherOS region.** *(once)* At the petitboot shell:
 
 ```
-sh /tmp/*/mnt/*/partition-region.sh
+sh /tmp/petitboot/mnt/sda1/partition-region.sh
 ```
 
 Only needed once, or again if the region is recreated. It is not part of the
@@ -224,7 +263,7 @@ Sizes are in raw sectors throughout, because petitboot's `parted` mishandles
 md5 from step 5:
 
 ```
-sh /tmp/*/mnt/*/write-image.sh <md5>
+sh /tmp/petitboot/mnt/sda1/write-image.sh <md5>
 ```
 
 The image name defaults to `ps3root4g.img.gz`, which is what step 5 produces,
@@ -232,7 +271,7 @@ so it only needs passing when the file is called something else — a second
 argument, before the optional size in MiB:
 
 ```
-sh /tmp/*/mnt/*/write-image.sh <md5> ps3root18g.img.gz 18432
+sh /tmp/petitboot/mnt/sda1/write-image.sh <md5> ps3root18g.img.gz 18432
 ```
 
 Pass the size too when the image is not 4 GiB, or the hash check only verifies
@@ -304,12 +343,29 @@ happened:
 | `61-ps3-persistent-storage.rules` | Confirmed: `/dev/disk/by-label` populated, `blkid` working |
 | `kernel-patch.sh`, `kernel-config.sh` | Run. Produced the kernel that boots |
 | `build-image.sh`, `partition-region.sh` | Run. Produced the image and partition table now on the console |
-| `write-image.sh` | Generic form of a verified procedure. Every development write used an ad-hoc variant with the hash written in; this parameterised file has not itself been run |
-| `build-rootfs.sh` | **Not run.** Written afterwards so the steps above are followable from a clean machine. Modelled on the tree that boots, but never built one end to end |
+| `write-image.sh` | Run. Wrote and verified the image now on the console |
+| `build-rootfs.sh` | Run. Built the tree that boots |
 
-Neither unrun script can damage the console on its own. `build-rootfs.sh` only
-writes to a directory on the build machine, and `write-image.sh` stops before
-the content check if the hash does not match. The risk is a wasted cycle.
+**Every script in this repository has run on hardware, in the order above.** A
+full dry run went from a clean machine to booting Debian: a fresh tree at
+`/srv/ps3root-test`, kernel and modules installed into it, image built,
+partitioned and written at petitboot, booted.
+
+Numbers from that run, which are the ones to expect:
+
+| | |
+|---|---|
+| debootstrap and packages | about 20 minutes, 8-core host, under emulation |
+| resulting tree | 721 MB |
+| image | 875 MB used of a 4 GiB filesystem |
+| initrd | 13.9 MB |
+| gzipped image on the stick | 337 MB |
+| kernel release | `6.4.0-g98ec4e7cee0f+` |
+
+The tree is 721 MB rather than the 1.4 GB quoted in earlier notes because
+`build-rootfs.sh` now runs `apt-get clean`. The earlier tree carried every
+`.deb` it had downloaded, and packaging those into the image cost write time on
+every cycle.
 
 ## How it works
 

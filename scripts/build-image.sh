@@ -39,6 +39,10 @@ mount -o loop "$IMG" "$MNT"
 # but was missing almost everything under /usr
 cp -a "$ROOTFS/." "$MNT/"
 
+# The tree keeps qemu-ppc64-static so step 4 can chroot into it on hosts whose
+# binfmt handler lacks the F flag. The console has no use for it.
+rm -f "$MNT/usr/bin/qemu-ppc64-static"
+
 echo
 echo "verifying"
 # A tree where step 4's mkinitramfs failed otherwise packages cleanly and fails

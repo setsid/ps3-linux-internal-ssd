@@ -2,7 +2,7 @@
 # Write a gzipped root filesystem image to the OtherOS region and verify it.
 # Runs at the petitboot shell. Put this and the image on a USB stick together:
 #
-#   sh /tmp/*/mnt/*/write-image.sh <expected-md5> [image.gz] [size-in-MiB]
+#   sh /tmp/petitboot/mnt/sda1/write-image.sh <md5> [image.gz] [size-in-MiB]
 #
 # The md5, image name and size are arguments rather than constants because they
 # change with every build. build-image.sh prints the md5 when it finishes.
@@ -11,14 +11,21 @@
 #
 # Logs to write-image-out.txt beside itself, because getting text off
 # petitboot any other way means photographing a television.
-#
-# This is the generic form of a procedure that was run repeatedly during
-# development in ad-hoc variants with the hash written into the script. The
-# sequence below is what worked; this exact file has not itself been run on
-# hardware. See docs/troubleshooting.md.
+
 
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
 HERE=$(dirname "$0")
+
+# One accent colour, green for success, red for failure, bold for the thing
+# that must not be got wrong. Off when not a terminal, when TERM is dumb, or
+# when NO_COLOR is set.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+    B=$(printf '\033[1m');  N=$(printf '\033[0m')
+    G=$(printf '\033[32m'); R=$(printf '\033[31m')
+    C=$(printf '\033[36m'); D=$(printf '\033[2m')
+else
+    B=; N=; G=; R=; C=; D=
+fi
 DEV=/dev/ps3dd1
 EXPECT="$1"
 IMG="$HERE/${2:-ps3root4g.img.gz}"
@@ -32,6 +39,14 @@ rm -f "$STAMP"
     echo "usage: write-image.sh <md5> [image.gz] [MiB]"; exit 1; }
 
 {
+echo "=== paths ==="
+# Enumeration order is not guaranteed once other USB devices are attached, so
+# print what this actually resolved to rather than assuming sda1.
+echo "stick:  $HERE"
+echo "image:  $IMG"
+echo "target: $DEV"
+
+echo
 echo "=== image ==="
 ls -l "$IMG" || { echo "$IMG not found"; exit 1; }
 
@@ -102,7 +117,7 @@ echo "=== labels (both must be found) ==="
 blkid "$DEV" /dev/ps3dd2
 
 echo
-echo "done - reboot and select Debian"
+echo "write complete and verified"
 
 # Last act of the block. Anything above that exits early skips this, which is
 # how the real status escapes the subshell that `| tee` creates.
@@ -111,10 +126,46 @@ echo ok > "$STAMP"
 
 mount -o remount,rw "$HERE" 2>/dev/null
 cp /tmp/write-image-out.txt "$HERE/write-image-out.txt" 2>/dev/null
+
+# Cumulative session log. The per-script files above are overwritten on every
+# run; a session spans both scripts, so append here to keep it readable as one.
+{
+    echo
+    echo "===== write-image  $(date 2>/dev/null || echo 'no clock') ====="
+    cat /tmp/write-image-out.txt
+} >> "$HERE/petitboot-log.txt" 2>/dev/null
 sync
 
 if [ ! -f "$STAMP" ]; then
-    echo "FAILED - see write-image-out.txt on the stick" >&2
+    echo "${R}${B}FAILED.${N} Nothing was booted and nothing is lost." >&2
+    echo "The full log is on the stick: write-image-out.txt" >&2
+    echo "Do not reboot into Debian - the image is incomplete." >&2
     exit 1
 fi
+
+# Printed to the terminal only, after the log has been copied, so the log files
+# on the stick stay free of escape sequences.
+echo
+echo "${G}${B}Write complete and verified.${N}"
+echo "The image on ${DEV} matches the expected hash."
+echo
+echo "${C}What to do now${N}"
+echo
+echo "  1. Reboot the console."
+echo "  2. At the petitboot menu choose ${B}debian${N} - the first entry."
+echo "     ${B}Not debian-failsafe.${N} That exists only for the case where the"
+echo "     first entry drops you at an initramfs prompt. Choosing it by"
+echo "     mistake boots with several hardware features switched off for no"
+echo "     reason."
+echo
+echo "The USB stick is finished with. Leave it in or take it out - Debian does"
+echo "not need it. This session's logs are at the root of the stick:"
+echo "  ${D}$HERE/partition-out.txt${N}"
+echo "  ${D}$HERE/write-image-out.txt${N}"
+echo "  ${D}$HERE/petitboot-log.txt${N}"
+echo
+echo "SSH is enabled and the machine takes a DHCP address as eth0, so you can"
+echo "log in over the network instead of using the television. First boot is"
+echo "slow - 256 MB of RAM doing first-boot service setup."
+echo
 exit 0

@@ -226,10 +226,11 @@ in_chroot systemctl enable systemd-resolved || true
 rm -f "$ROOTFS/etc/resolv.conf"
 in_chroot ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 
-# The emulator is a build-host artefact, not part of the target.
-if [ -n "$QEMU" ]; then
-    rm -f "$ROOTFS/usr/bin/$(basename "$QEMU")"
-fi
+# The emulator stays in the tree deliberately. README step 4 chroots in here to
+# run mkinitramfs, and on a host whose binfmt handler lacks the F flag the
+# interpreter is not held open across the chroot - the copy inside the tree is
+# what makes that work. build-image.sh removes it from the image instead, so
+# nothing useless reaches the console.
 
 echo
 echo "=== unmounting ==="
