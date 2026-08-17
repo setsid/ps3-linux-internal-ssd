@@ -38,7 +38,54 @@ kernel change is 3, 4, 5, 6, 8, 9 — steps 3 and 4 first, or step 5 packages a
 tree that still contains the old `vmlinux` and you spend forty minutes writing
 and booting the kernel you were trying to replace.
 
-## Steps
+## The short way
+
+One tool drives everything on the host side and leaves you a stick that the
+console can use:
+
+```
+sudo ./scripts/make-debian-installer.sh
+```
+
+It works out what is already done, shows you a checklist, and offers to run
+everything outstanding, the rebuild loop only, or a single step. It calls the
+same scripts the numbered steps below call — it is a driver, not a
+reimplementation. If the two ever disagree, the scripts are right and the tool
+is the bug.
+
+It pauses before each step to say what it is about to do and roughly how long
+that takes, keeps the real command output on screen and logs all of it
+unfiltered to a file, and picks the USB stick for you from the removable
+devices it can find. Non-removable disks are never offered.
+
+**How long.** First run is around 90 minutes: about 20 for debootstrap, 15 or
+more for the kernel depending on cores, the rest in image build, transfer and
+write. The rebuild loop afterwards is under 15 minutes. If you have been told
+45 minutes and a step sits there for 20, you will assume it has hung and kill
+it — it has not.
+
+`--plain` turns off the cursor addressing, colour and progress bars and behaves
+exactly as the individual scripts do. That happens automatically when output is
+not a terminal, when `TERM` is dumb, or when `NO_COLOR` is set.
+
+Then, at the console:
+
+```
+sh /tmp/petitboot/mnt/sda1/partition-region.sh    # first time only
+sh /tmp/petitboot/mnt/sda1/write-image.sh
+```
+
+`write-image.sh` needs no arguments — the tool writes a `manifest.txt` to the
+stick with the image name, hash, size and kernel release, and the script reads
+it. That is the last thing anyone had to transcribe by hand: a 32-character
+hash, typed at a television, on a USB keyboard, late at night.
+
+Reboot, choose **debian** — not `debian-failsafe` — and you have Debian.
+
+## The steps, one at a time
+
+The tool runs these. They are also the documentation of what it is doing, and
+the fallback when something goes wrong in the middle.
 
 Every command below runs from the root of this repository, so script paths are
 relative to it. `~/ps3-linux` is the kernel tree from step 1 — adjust it
@@ -345,6 +392,7 @@ happened:
 | `build-image.sh`, `partition-region.sh` | Run. Produced the image and partition table now on the console |
 | `write-image.sh` | Run. Wrote and verified the image now on the console |
 | `build-rootfs.sh` | Run. Built the tree that boots |
+| `make-debian-installer.sh` | **Not run end to end.** Written after the dry run. Its state detection, progress polling, removable-device scan and menus are tested; a full run through it is not. It calls the scripts above rather than reimplementing them, so what it drives is verified even where the driver is not |
 
 **Every script in this repository has run on hardware, in the order above.** A
 full dry run went from a clean machine to booting Debian: a fresh tree at
@@ -444,7 +492,8 @@ docs/        design notes, kernel config, troubleshooting log
 
 `scripts/` splits in two. Those run on the host build the kernel and image;
 those run at the petitboot shell write to the console and log their output to
-the USB stick.
+the USB stick. `make-debian-installer.sh` is the host-side driver that calls
+the rest in order.
 
 | Document | |
 |---|---|

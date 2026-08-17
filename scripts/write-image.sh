@@ -2,12 +2,15 @@
 # Write a gzipped root filesystem image to the OtherOS region and verify it.
 # Runs at the petitboot shell. Put this and the image on a USB stick together:
 #
-#   sh /tmp/petitboot/mnt/sda1/write-image.sh <md5> [image.gz] [size-in-MiB]
+#   sh /tmp/petitboot/mnt/sda1/write-image.sh [md5] [image.gz] [size-in-MiB]
 #
-# The md5, image name and size are arguments rather than constants because they
-# change with every build. build-image.sh prints the md5 when it finishes.
-# The image name defaults to ps3root4g.img.gz, matching README step 5. Pass it
-# if you build a different size, for example ps3root18g.img.gz.
+# With no arguments it reads manifest.txt from beside itself, which
+# make-debian-installer.sh writes when it prepares the stick. That is the whole
+# point of the manifest: it saves transcribing a 32-character hash at a
+# television, on a USB keyboard, late at night.
+#
+# Arguments override the manifest, in case you build an image by hand:
+# the md5, then the image name, then its size in MiB.
 #
 # Logs to write-image-out.txt beside itself, because getting text off
 # petitboot any other way means photographing a television.
@@ -27,16 +30,32 @@ else
     B=; N=; G=; R=; C=; D=
 fi
 DEV=/dev/ps3dd1
-EXPECT="$1"
-IMG="$HERE/${2:-ps3root4g.img.gz}"
-MB="${3:-4096}"
+EXPECT="${1:-}"
+IMG_NAME="${2:-}"
+MB="${3:-}"
 MNT=/mnt/chk
+MANIFEST="$HERE/manifest.txt"
+
+# Fill in whatever was not given from the manifest.
+if [ -f "$MANIFEST" ]; then
+    [ -n "$EXPECT" ]   || EXPECT=$(sed -n 's/^md5=//p' "$MANIFEST" | head -1)
+    [ -n "$IMG_NAME" ] || IMG_NAME=$(sed -n 's/^image=//p' "$MANIFEST" | head -1)
+    [ -n "$MB" ]       || MB=$(sed -n 's/^size_mib=//p' "$MANIFEST" | head -1)
+    USED_MANIFEST=yes
+else
+    USED_MANIFEST=no
+fi
+
+IMG="$HERE/${IMG_NAME:-ps3root4g.img.gz}"
+MB="${MB:-4096}"
 STAMP=/tmp/write-image-ok
 
 rm -f "$STAMP"
 
 [ -n "$EXPECT" ] || {
-    echo "usage: write-image.sh <md5> [image.gz] [MiB]"; exit 1; }
+    echo "No md5 given and no manifest.txt beside this script."
+    echo "usage: write-image.sh <md5> [image.gz] [MiB]"
+    exit 1; }
 
 {
 echo "=== paths ==="
@@ -45,6 +64,14 @@ echo "=== paths ==="
 echo "stick:  $HERE"
 echo "image:  $IMG"
 echo "target: $DEV"
+echo "size:   $MB MiB"
+echo "md5:    $EXPECT"
+if [ "$USED_MANIFEST" = yes ]; then
+    echo "source: manifest.txt"
+    sed -n 's/^kernel_release=/kernel: /p;s/^built=/built:  /p' "$MANIFEST"
+else
+    echo "source: command line"
+fi
 
 echo
 echo "=== image ==="
