@@ -75,3 +75,8 @@ make ARCH=powerpc CROSS_COMPILE=powerpc64-linux-gnu- olddefconfig
 echo
 grep -E '^CONFIG_(DEVTMPFS|CGROUPS|MEMCG|NAMESPACES|USER_NS|FHANDLE|SECCOMP|FANOTIFY|TMPFS_POSIX_ACL|AUTOFS_FS)' .config
 grep -E 'LOCALVERSION' .config
+
+# This is the string /lib/modules will be named after, and the argument
+# mkinitramfs needs in README step 4. Read it, do not guess it.
+echo
+echo "kernel release: $(make -s ARCH=powerpc CROSS_COMPILE=powerpc64-linux-gnu- kernelrelease)"

@@ -1,0 +1,621 @@
+From: setsid <13945393+setsid@users.noreply.github.com>
+Subject: [PATCH 2/2] ps3disk: expose every accessible storage region
+
+The PS3 hypervisor divides the internal drive into regions and reports
+which of them the guest LPAR may reach. Under Sony's OtherOS that was
+exactly one, so ps3stor_probe_access() could take the first accessible
+region and ps3disk could expose it as the one block device belonging to
+the hypervisor device.
+
+OtherOS++ firmware skips the ACL check and makes every region reachable.
+On a PS3 Slim running Evilnat 4.93 that is four: region 0 is the whole
+physical drive, regions 1 and 2 belong to GameOS, and region 3 is the one
+created for OtherOS. ps3disk still exposes a single region and logs
+
+	4 accessible regions found. Only the first one will be used
+
+so /dev/ps3da is the whole physical drive and the region the machine
+actually boots from cannot be reached at all. Choosing the last region
+rather than the first, as out of tree patches do, only swaps which region
+is lost, and renames it relative to petitboot, whose kernel exposes all
+four as ps3da through ps3dd.
+
+Give every exposed region its own gendisk.
+
+Region identity is carried in a per region private structure reachable
+from both queue->queuedata and gendisk->private_data, so the request path
+never reconstructs the region from the device number and nothing depends
+on the minor allocation scheme.
+
+The hypervisor accepts one outstanding command per device, and the device
+has one bounce buffer, one command tag and one interrupt. Every region
+queue is therefore created from a single blk_mq_tag_set with a queue depth
+of one. Queues built from one tag set draw their tags from the same
+bitmap, so that single tag is the device wide permit to use the bounce
+buffer, held from blk_mq_start_request() until the interrupt handler ends
+the request, which it does only after any read data has been copied out.
+This is how SCSI serialises several LUNs behind a host with can_queue set
+to one. A busy test in ps3disk_queue_rq() defers with BLK_STS_DEV_RESOURCE
+rather than corrupting the bounce buffer, should that ever fail to hold.
+
+Names follow the region index rather than a running count, so a region
+keeps its name whichever other regions are exposed, and the names agree
+with petitboot: ps3da is region 0 and ps3dd is the OtherOS region of a
+standard OtherOS++ layout.
+
+Regions are read-only unless selected otherwise. The exception is the
+OtherOS region, taken to be the highest numbered exposed region that does
+not span the whole drive. Exposing 870 GB of GameOS data as a writable
+block device one letter away from the root filesystem is not a reasonable
+default; a mistyped mkfs there costs a GameOS reinstall.
+
+Consequences for userland:
+
+  - On a standard OtherOS++ layout the OtherOS region is /dev/ps3dd, not
+    /dev/ps3da. Anyone carrying an earlier out of tree region patch must
+    update root=, fstab and the bootloader configuration. Mounting by
+    LABEL= or UUID= makes the question moot.
+
+  - Regions that were previously invisible now appear, read-only. The
+    GameOS cache region can be mounted read-only from Linux, which is a
+    convenient way to move files between the two systems.
+
+  - Three module parameters: regions= selects which regions appear,
+    writable= forces regions read-write, and otheros_rw=0 turns off the
+    read-write default for the detected OtherOS region.
+
+Exposing one block device per accessible region follows T2 SDE's
+architecture/powerpc64/package/linux/0010-ps3stor-multiple-regions.patch,
+which established the approach. This implementation differs in carrying
+the region in private data rather than deriving it from the minor number,
+in serialising submission through a shared tag set, in defaulting to
+read-only, and in staying inside ps3disk.c: ps3disk computes its region id
+locally and never calls ps3stor_read_write_sectors(), so asm/ps3stor.h,
+ps3stor_lib.c, ps3rom and ps3flash need no change.
+
+Applies on top of René Rebe's bounce buffer offset fix, patch 0001 in this
+series, which is required for any multi-segment transfer to be correct.
+
+Not upstream. Region 0 is only reachable on custom firmware, and the
+read-only policy is specific to the OtherOS++ layout.
+
+Based on Linux 6.4.
+---
+ drivers/block/ps3disk.c | 389 ++++++++++++++++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 312 insertions(+), 77 deletions(-)
+
+--- a/drivers/block/ps3disk.c
++++ b/drivers/block/ps3disk.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <linux/ata.h>
++#include <linux/bitmap.h>
+ #include <linux/blk-mq.h>
+ #include <linux/slab.h>
+ #include <linux/module.h>
+@@ -27,14 +28,33 @@
+ #define PS3DISK_NAME		"ps3d%c"
+ 
+ 
+-struct ps3disk_private {
+-	spinlock_t lock;		/* Request queue spinlock */
+-	struct blk_mq_tag_set tag_set;
++/*
++ * One of these per exposed region.  Every region has its own gendisk and
++ * request queue, but they all share the bounce buffer, the command tag and
++ * the interrupt of the underlying hypervisor device.
++ *
++ * Both queue->queuedata and gendisk->private_data point here, so the request
++ * path knows which region it is addressing without having to reconstruct it
++ * from the device number.
++ */
++struct ps3disk_region_priv {
++	struct ps3_storage_device *dev;
+ 	struct gendisk *gendisk;
++	unsigned int region_idx;	/* Index into dev->regions[] */
++	unsigned int devidx;		/* Name letter and first minor */
++};
++
++struct ps3disk_private {
++	spinlock_t lock;		/* Protects req */
++	struct blk_mq_tag_set tag_set;	/* Shared by every region queue */
++	struct request *req;		/* In flight request, device wide */
+ 	unsigned int blocking_factor;
+-	struct request *req;
+ 	u64 raw_capacity;
+ 	unsigned char model[ATA_ID_PROD_LEN+1];
++	unsigned int devidx_base;	/* First index taken in ps3disk_mask */
++	unsigned int devidx_span;	/* Number of indices taken */
++	unsigned int num_disks;		/* Live entries in disk[] */
++	struct ps3disk_region_priv disk[];
+ };
+ 
+ 
+@@ -71,6 +91,18 @@
+ 
+ static int ps3disk_major;
+ 
++static unsigned long ps3disk_region_mask;
++module_param_named(regions, ps3disk_region_mask, ulong, 0444);
++MODULE_PARM_DESC(regions, "Bitmask of regions to expose (0: all accessible)");
++
++static unsigned long ps3disk_writable_mask;
++module_param_named(writable, ps3disk_writable_mask, ulong, 0444);
++MODULE_PARM_DESC(writable, "Bitmask of regions to expose read-write");
++
++static bool ps3disk_otheros_rw = true;
++module_param_named(otheros_rw, ps3disk_otheros_rw, bool, 0444);
++MODULE_PARM_DESC(otheros_rw, "Expose the OtherOS region read-write");
++
+ 
+ static const struct block_device_operations ps3disk_fops = {
+ 	.owner		= THIS_MODULE,
+@@ -95,13 +127,14 @@
+ }
+ 
+ static blk_status_t ps3disk_submit_request_sg(struct ps3_storage_device *dev,
++					      struct ps3disk_region_priv *rp,
+ 					      struct request *req)
+ {
+ 	struct ps3disk_private *priv = ps3_system_bus_get_drvdata(&dev->sbd);
+ 	int write = rq_data_dir(req), res;
+ 	const char *op = write ? "write" : "read";
+ 	u64 start_sector, sectors;
+-	unsigned int region_id = dev->regions[dev->region_idx].id;
++	unsigned int region_id = dev->regions[rp->region_idx].id;
+ 
+ #ifdef DEBUG
+ 	unsigned int n = 0;
+@@ -163,6 +196,7 @@
+ }
+ 
+ static blk_status_t ps3disk_do_request(struct ps3_storage_device *dev,
++				       struct ps3disk_region_priv *rp,
+ 				       struct request *req)
+ {
+ 	dev_dbg(&dev->sbd.core, "%s:%u\n", __func__, __LINE__);
+@@ -172,7 +206,7 @@
+ 		return ps3disk_submit_flush_request(dev, req);
+ 	case REQ_OP_READ:
+ 	case REQ_OP_WRITE:
+-		return ps3disk_submit_request_sg(dev, req);
++		return ps3disk_submit_request_sg(dev, rp, req);
+ 	default:
+ 		blk_dump_rq_flags(req, DEVICE_NAME " bad request");
+ 		return BLK_STS_IOERR;
+@@ -183,14 +217,27 @@
+ 				     const struct blk_mq_queue_data *bd)
+ {
+ 	struct request_queue *q = hctx->queue;
+-	struct ps3_storage_device *dev = q->queuedata;
++	struct ps3disk_region_priv *rp = q->queuedata;
++	struct ps3_storage_device *dev = rp->dev;
+ 	struct ps3disk_private *priv = ps3_system_bus_get_drvdata(&dev->sbd);
+ 	blk_status_t ret;
+ 
+ 	blk_mq_start_request(bd->rq);
+ 
+ 	spin_lock_irq(&priv->lock);
+-	ret = ps3disk_do_request(dev, bd->rq);
++	if (priv->req) {
++		/*
++		 * The shared tag set should make this unreachable; see the
++		 * comment above ps3disk_probe().  Defer rather than overwrite
++		 * the bounce buffer and the in flight command tag.
++		 */
++		spin_unlock_irq(&priv->lock);
++		dev_err_once(&dev->sbd.core,
++			     "%s:%u: device busy, deferring request\n",
++			     __func__, __LINE__);
++		return BLK_STS_DEV_RESOURCE;
++	}
++	ret = ps3disk_do_request(dev, rp, bd->rq);
+ 	spin_unlock_irq(&priv->lock);
+ 
+ 	return ret;
+@@ -202,6 +249,7 @@
+ 	struct ps3disk_private *priv;
+ 	struct request *req;
+ 	int res, read;
++	unsigned int i;
+ 	blk_status_t error;
+ 	u64 tag, status;
+ 	const char *op;
+@@ -254,7 +302,12 @@
+ 	blk_mq_end_request(req, error);
+ 	spin_unlock(&priv->lock);
+ 
+-	blk_mq_run_hw_queues(priv->gendisk->queue, true);
++	/*
++	 * The bounce buffer is free again.  The queue with work waiting is not
++	 * necessarily the one that just completed, so kick all of them.
++	 */
++	for (i = 0; i < priv->num_disks; i++)
++		blk_mq_run_hw_queues(priv->disk[i].gendisk->queue, true);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -370,6 +423,53 @@
+ 	return 0;
+ }
+ 
++/*
++ * Region 0 of a storage device is the whole physical drive.  Under OtherOS++
++ * it is accessible, and writing to it overwrites the GameOS regions, so it
++ * must never be picked as the region to expose read-write by default.
++ *
++ * ATA IDENTIFY gives the authoritative size.  If it failed, fall back to the
++ * LV1 convention that region id 0 addresses the whole device.
++ */
++static bool ps3disk_region_is_whole_drive(struct ps3_storage_device *dev,
++					  struct ps3disk_private *priv,
++					  unsigned int idx)
++{
++	if (!dev->regions[idx].id)
++		return true;
++
++	return priv->raw_capacity &&
++	       dev->regions[idx].size * priv->blocking_factor >=
++	       priv->raw_capacity;
++}
++
++/*
++ * OtherOS++ creates the OtherOS region last, so it has the highest index of
++ * the regions the hypervisor lets us reach.  Region 0 and anything that spans
++ * the whole drive are skipped: getting this wrong in the permissive direction
++ * exposes the GameOS regions read-write, which costs a GameOS reinstall,
++ * while getting it wrong in the restrictive direction costs a reboot with a
++ * module parameter.  Returns the region index, or -1 if no region looks like
++ * an OtherOS region, in which case nothing is writable by default.
++ */
++static int ps3disk_find_otheros_region(struct ps3_storage_device *dev,
++				       struct ps3disk_private *priv,
++				       unsigned long exposed)
++{
++	unsigned int i;
++	int found = -1;
++
++	for_each_set_bit(i, &exposed, dev->num_regions) {
++		if (!i)
++			continue;	/* Region 0 is the whole drive */
++		if (ps3disk_region_is_whole_drive(dev, priv, i))
++			continue;
++		found = i;
++	}
++
++	return found;
++}
++
+ static unsigned long ps3disk_mask;
+ 
+ static DEFINE_MUTEX(ps3disk_mask_mutex);
+@@ -378,14 +478,113 @@
+ 	.queue_rq	= ps3disk_queue_rq,
+ };
+ 
++static int ps3disk_add_region(struct ps3_storage_device *dev,
++			      struct ps3disk_private *priv, unsigned int idx,
++			      bool writable)
++{
++	struct ps3_storage_region *region = &dev->regions[idx];
++	struct ps3disk_region_priv *rp = &priv->disk[priv->num_disks];
++	struct request_queue *queue;
++	struct gendisk *gendisk;
++	int error;
++
++	rp->dev = dev;
++	rp->region_idx = idx;
++	rp->devidx = priv->devidx_base + idx;
++
++	gendisk = blk_mq_alloc_disk(&priv->tag_set, rp);
++	if (IS_ERR(gendisk)) {
++		dev_err(&dev->sbd.core,
++			"%s:%u: blk_mq_alloc_disk failed for region %u\n",
++			__func__, __LINE__, idx);
++		return PTR_ERR(gendisk);
++	}
++
++	queue = gendisk->queue;
++
++	blk_queue_max_hw_sectors(queue, dev->bounce_size >> 9);
++	blk_queue_dma_alignment(queue, dev->blk_size-1);
++	blk_queue_logical_block_size(queue, dev->blk_size);
++
++	blk_queue_write_cache(queue, true, false);
++
++	blk_queue_max_segments(queue, -1);
++	blk_queue_max_segment_size(queue, dev->bounce_size);
++
++	rp->gendisk = gendisk;
++	gendisk->major = ps3disk_major;
++	gendisk->first_minor = rp->devidx * PS3DISK_MINORS;
++	gendisk->minors = PS3DISK_MINORS;
++	gendisk->fops = &ps3disk_fops;
++	gendisk->private_data = rp;
++	snprintf(gendisk->disk_name, sizeof(gendisk->disk_name), PS3DISK_NAME,
++		 rp->devidx+'a');
++	set_capacity(gendisk, region->size*priv->blocking_factor);
++
++	/* Before device_add_disk(), so the first partition scan sees it */
++	set_disk_ro(gendisk, !writable);
++
++	dev_info(&dev->sbd.core,
++		 "%s: region %u id %u start %llu size %llu (%llu MiB) %s\n",
++		 gendisk->disk_name, idx, region->id, region->start,
++		 region->size, get_capacity(gendisk) >> 11,
++		 writable ? "read-write" : "read-only");
++
++	error = device_add_disk(&dev->sbd.core, gendisk, NULL);
++	if (error) {
++		put_disk(gendisk);
++		return error;
++	}
++
++	priv->num_disks++;
++	return 0;
++}
++
++static void ps3disk_del_disks(struct ps3disk_private *priv)
++{
++	unsigned int i;
++
++	/*
++	 * Delete every disk before releasing any of them, so no region queue
++	 * is left able to submit while another is being torn down.
++	 */
++	for (i = 0; i < priv->num_disks; i++)
++		del_gendisk(priv->disk[i].gendisk);
++	for (i = 0; i < priv->num_disks; i++)
++		put_disk(priv->disk[i].gendisk);
++	priv->num_disks = 0;
++}
++
++/*
++ * Serialisation across regions.
++ *
++ * LV1 accepts one outstanding command per storage device, not per region.
++ * The device has one bounce buffer, one command tag and one interrupt, which
++ * all regions share, so only one request may be in flight for the device even
++ * though every region has its own request queue.
++ *
++ * That is enforced by allocating a single blk_mq_tag_set with a queue depth
++ * of one and creating every region queue from it.  All queues built from one
++ * tag set take their tags from the same bitmap, so the single tag is the
++ * device wide permit to use the bounce buffer.  A request holds it from
++ * blk_mq_start_request() until blk_mq_end_request(), which the interrupt
++ * handler calls only after the hypervisor command has completed and any read
++ * data has been copied out of the bounce buffer.  This is how SCSI serialises
++ * several LUNs behind a host with can_queue == 1.
++ *
++ * Per queue tag sets plus a device wide busy flag were considered and
++ * rejected: every collision would then pay the 3 ms BLK_STS_DEV_RESOURCE
++ * retry, and stopping the other queues on submit would add a second piece of
++ * state to keep consistent with priv->req.  The busy test in
++ * ps3disk_queue_rq() is kept only as a backstop.
++ */
+ static int ps3disk_probe(struct ps3_system_bus_device *_dev)
+ {
+ 	struct ps3_storage_device *dev = to_ps3_storage_device(&_dev->core);
+ 	struct ps3disk_private *priv;
+-	int error;
+-	unsigned int devidx;
+-	struct request_queue *queue;
+-	struct gendisk *gendisk;
++	unsigned long exposed, writable;
++	unsigned int devidx, span, i;
++	int otheros, error;
+ 
+ 	if (dev->blk_size < 512) {
+ 		dev_err(&dev->sbd.core,
+@@ -394,26 +593,22 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	BUILD_BUG_ON(PS3DISK_MAX_DISKS > BITS_PER_LONG);
+-	mutex_lock(&ps3disk_mask_mutex);
+-	devidx = find_first_zero_bit(&ps3disk_mask, PS3DISK_MAX_DISKS);
+-	if (devidx >= PS3DISK_MAX_DISKS) {
+-		dev_err(&dev->sbd.core, "%s:%u: Too many disks\n", __func__,
+-			__LINE__);
+-		mutex_unlock(&ps3disk_mask_mutex);
+-		return -ENOSPC;
++	if (!dev->num_regions || dev->num_regions > BITS_PER_LONG) {
++		dev_err(&dev->sbd.core,
++			"%s:%u: cannot handle %u regions\n", __func__,
++			__LINE__, dev->num_regions);
++		return -EINVAL;
+ 	}
+-	__set_bit(devidx, &ps3disk_mask);
+-	mutex_unlock(&ps3disk_mask_mutex);
+ 
+-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+-	if (!priv) {
+-		error = -ENOMEM;
+-		goto fail;
+-	}
++	BUILD_BUG_ON(PS3DISK_MAX_DISKS > BITS_PER_LONG);
++
++	priv = kzalloc(struct_size(priv, disk, dev->num_regions), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
+ 
+ 	ps3_system_bus_set_drvdata(_dev, priv);
+ 	spin_lock_init(&priv->lock);
++	priv->blocking_factor = dev->blk_size >> 9;
+ 
+ 	dev->bounce_size = BOUNCE_SIZE;
+ 	dev->bounce_buf = kmalloc(BOUNCE_SIZE, GFP_DMA);
+@@ -426,58 +621,95 @@
+ 	if (error)
+ 		goto fail_free_bounce;
+ 
+-	ps3disk_identify(dev);
+-
+-	error = blk_mq_alloc_sq_tag_set(&priv->tag_set, &ps3disk_mq_ops, 1,
+-					BLK_MQ_F_SHOULD_MERGE);
+-	if (error)
++	if (ps3disk_identify(dev))
++		dev_warn(&dev->sbd.core,
++			 "%s:%u: identify failed, region sizes unknown\n",
++			 __func__, __LINE__);
++
++	exposed = dev->accessible_regions & GENMASK(dev->num_regions - 1, 0);
++	if (ps3disk_region_mask)
++		exposed &= ps3disk_region_mask;
++	if (!exposed) {
++		dev_err(&dev->sbd.core,
++			"%s:%u: no region to expose, accessible 0x%lx\n",
++			__func__, __LINE__, dev->accessible_regions);
++		error = -ENODEV;
+ 		goto fail_teardown;
+-
+-	gendisk = blk_mq_alloc_disk(&priv->tag_set, dev);
+-	if (IS_ERR(gendisk)) {
+-		dev_err(&dev->sbd.core, "%s:%u: blk_mq_alloc_disk failed\n",
+-			__func__, __LINE__);
+-		error = PTR_ERR(gendisk);
+-		goto fail_free_tag_set;
+ 	}
+ 
+-	queue = gendisk->queue;
++	otheros = ps3disk_find_otheros_region(dev, priv, exposed);
+ 
+-	blk_queue_max_hw_sectors(queue, dev->bounce_size >> 9);
+-	blk_queue_dma_alignment(queue, dev->blk_size-1);
+-	blk_queue_logical_block_size(queue, dev->blk_size);
++	writable = ps3disk_writable_mask & exposed;
++	if (otheros >= 0 && ps3disk_otheros_rw)
++		writable |= BIT(otheros);
++
++	if (otheros >= 0) {
++		dev_info(&dev->sbd.core, "OtherOS region is region %d\n",
++			 otheros);
++	} else {
++		dev_info(&dev->sbd.core,
++			 "no OtherOS region found, all regions read-only\n");
++		dev_info(&dev->sbd.core,
++			 "use ps3disk.writable=<mask> to override\n");
++	}
++
++	for (i = 0; i < dev->num_regions; i++) {
++		if (test_bit(i, &exposed))
++			continue;
++		dev_info(&dev->sbd.core, "region %u: id %u size %llu, %s\n",
++			 i, dev->regions[i].id, dev->regions[i].size,
++			 test_bit(i, &dev->accessible_regions) ?
++			 "not selected" : "not accessible");
++	}
++
++	/*
++	 * Reserve one name letter per region index rather than one per disk,
++	 * so a region keeps the same name whichever other regions are exposed
++	 * and the names match those of the petitboot kernel.
++	 */
++	span = __fls(exposed) + 1;
+ 
+-	blk_queue_write_cache(queue, true, false);
++	mutex_lock(&ps3disk_mask_mutex);
++	devidx = bitmap_find_next_zero_area(&ps3disk_mask, PS3DISK_MAX_DISKS,
++					    0, span, 0);
++	if (devidx + span > PS3DISK_MAX_DISKS) {
++		dev_err(&dev->sbd.core, "%s:%u: Too many disks\n", __func__,
++			__LINE__);
++		mutex_unlock(&ps3disk_mask_mutex);
++		error = -ENOSPC;
++		goto fail_teardown;
++	}
++	bitmap_set(&ps3disk_mask, devidx, span);
++	mutex_unlock(&ps3disk_mask_mutex);
+ 
+-	blk_queue_max_segments(queue, -1);
+-	blk_queue_max_segment_size(queue, dev->bounce_size);
++	priv->devidx_base = devidx;
++	priv->devidx_span = span;
+ 
+-	priv->gendisk = gendisk;
+-	gendisk->major = ps3disk_major;
+-	gendisk->first_minor = devidx * PS3DISK_MINORS;
+-	gendisk->minors = PS3DISK_MINORS;
+-	gendisk->fops = &ps3disk_fops;
+-	gendisk->private_data = dev;
+-	snprintf(gendisk->disk_name, sizeof(gendisk->disk_name), PS3DISK_NAME,
+-		 devidx+'a');
+-	priv->blocking_factor = dev->blk_size >> 9;
+-	set_capacity(gendisk,
+-		     dev->regions[dev->region_idx].size*priv->blocking_factor);
++	error = blk_mq_alloc_sq_tag_set(&priv->tag_set, &ps3disk_mq_ops, 1,
++					BLK_MQ_F_SHOULD_MERGE);
++	if (error)
++		goto fail_free_devidx;
+ 
+-	dev_info(&dev->sbd.core,
+-		 "%s is a %s (%llu MiB total, %llu MiB for OtherOS)\n",
+-		 gendisk->disk_name, priv->model, priv->raw_capacity >> 11,
+-		 get_capacity(gendisk) >> 11);
++	for_each_set_bit(i, &exposed, dev->num_regions) {
++		error = ps3disk_add_region(dev, priv, i,
++					   test_bit(i, &writable));
++		if (error)
++			goto fail_del_disks;
++	}
+ 
+-	error = device_add_disk(&dev->sbd.core, gendisk, NULL);
+-	if (error)
+-		goto fail_cleanup_disk;
++	dev_info(&dev->sbd.core, "%s (%llu MiB total), %u of %u regions\n",
++		 priv->model, priv->raw_capacity >> 11, priv->num_disks,
++		 dev->num_regions);
+ 
+ 	return 0;
+-fail_cleanup_disk:
+-	put_disk(gendisk);
+-fail_free_tag_set:
++
++fail_del_disks:
++	ps3disk_del_disks(priv);
+ 	blk_mq_free_tag_set(&priv->tag_set);
++fail_free_devidx:
++	mutex_lock(&ps3disk_mask_mutex);
++	bitmap_clear(&ps3disk_mask, priv->devidx_base, priv->devidx_span);
++	mutex_unlock(&ps3disk_mask_mutex);
+ fail_teardown:
+ 	ps3stor_teardown(dev);
+ fail_free_bounce:
+@@ -485,10 +717,6 @@
+ fail_free_priv:
+ 	kfree(priv);
+ 	ps3_system_bus_set_drvdata(_dev, NULL);
+-fail:
+-	mutex_lock(&ps3disk_mask_mutex);
+-	__clear_bit(devidx, &ps3disk_mask);
+-	mutex_unlock(&ps3disk_mask_mutex);
+ 	return error;
+ }
+ 
+@@ -497,13 +725,20 @@
+ 	struct ps3_storage_device *dev = to_ps3_storage_device(&_dev->core);
+ 	struct ps3disk_private *priv = ps3_system_bus_get_drvdata(&dev->sbd);
+ 
++	if (!priv)
++		return;		/* Probe failed, or .shutdown already ran */
++
++	ps3disk_del_disks(priv);
++	blk_mq_free_tag_set(&priv->tag_set);
++
+ 	mutex_lock(&ps3disk_mask_mutex);
+-	__clear_bit(MINOR(disk_devt(priv->gendisk)) / PS3DISK_MINORS,
+-		    &ps3disk_mask);
++	bitmap_clear(&ps3disk_mask, priv->devidx_base, priv->devidx_span);
+ 	mutex_unlock(&ps3disk_mask_mutex);
+-	del_gendisk(priv->gendisk);
+-	put_disk(priv->gendisk);
+-	blk_mq_free_tag_set(&priv->tag_set);
++
++	/*
++	 * One hypervisor device, one write cache: flush once, after every
++	 * region queue has been drained by del_gendisk().
++	 */
+ 	dev_notice(&dev->sbd.core, "Synchronizing disk cache\n");
+ 	ps3disk_sync_cache(dev);
+ 	ps3stor_teardown(dev);

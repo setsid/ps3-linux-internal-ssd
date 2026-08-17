@@ -1,43 +1,57 @@
 #!/usr/bin/env bash
 # Apply both driver patches to a PS3 kernel tree.
-# Locates the lines by content, so it survives context drift between trees.
 #
 #   ./kernel-patch.sh [kernel-tree]
+#
+# Both patches touch only drivers/block/ps3disk.c. Nothing outside that file
+# is modified, so drivers/ps3/ps3stor_lib.c stays pristine and ps3flash and
+# ps3rom keep upstream behaviour.
+#
+# Generated against the pristine v6.4 tag. 0001 applies with a small offset
+# to Geoff Levand's tree; 0002 applies on top of 0001.
 
 set -euo pipefail
 
 KDIR="${1:-$HOME/ps3-linux}"
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
 DISK="$KDIR/drivers/block/ps3disk.c"
-STOR="$KDIR/drivers/ps3/ps3stor_lib.c"
 
 [ -f "$DISK" ] || { echo "not a kernel tree: $KDIR" >&2; exit 1; }
 
-if grep -q 'offset += bvec.bv_len' "$DISK"; then
-    echo "ps3disk: already patched"
-else
-    cp "$DISK" "$DISK.orig"
-    python3 - "$DISK" <<'PY'
-import sys
-p = sys.argv[1]
-s = open(p).read()
-needle = "\t\t\tmemcpy_to_bvec(&bvec, dev->bounce_buf + offset);\n"
-if needle not in s:
-    sys.exit("ps3disk: expected line not found, tree differs from 6.4")
-open(p, "w").write(s.replace(needle, needle + "\n\t\toffset += bvec.bv_len;\n", 1))
-PY
-    echo "ps3disk: patched"
-fi
+apply() {
+    local patch="$1" marker="$2" name="$3"
 
-if grep -q '__fls(dev->accessible_regions)' "$STOR"; then
-    echo "ps3stor: already patched"
-else
-    cp "$STOR" "$STOR.orig"
-    sed -i 's|\tdev->region_idx = __ffs(dev->accessible_regions);|\tif (dev->sbd.match_id == PS3_MATCH_ID_STOR_DISK)\n\t\tdev->region_idx = __fls(dev->accessible_regions);\n\telse\n\t\tdev->region_idx = __ffs(dev->accessible_regions);|' "$STOR"
-    grep -q '__fls(dev->accessible_regions)' "$STOR" || {
-        echo "ps3stor: patch did not apply" >&2; exit 1; }
-    echo "ps3stor: patched"
-fi
+    if grep -q "$marker" "$DISK"; then
+        echo "$name: already applied"
+        return
+    fi
+    if ! patch -d "$KDIR" -p1 --forward --backup --suffix=.orig < "$patch"; then
+        echo "$name: did not apply to $KDIR" >&2
+        exit 1
+    fi
+    echo "$name: applied"
+}
+
+apply "$HERE/patches/0001-ps3disk-restore-bounce-buffer-offset.patch" \
+      'offset += bvec.bv_len' '0001 bounce buffer offset'
+
+apply "$HERE/patches/0002-ps3disk-expose-every-accessible-storage-region.patch" \
+      'ps3disk_find_otheros_region' '0002 multiple regions'
+
+# Confirm the result rather than trusting the exit status. Both of these
+# print nothing if the patches silently went to the wrong place.
+echo
+echo "=== bounce buffer offset ==="
+sed -n '/^static void ps3disk_scatter_gather/,/^}/p' "$DISK"
+
+echo "=== region selection ==="
+grep -n 'set_disk_ro\|rp->region_idx\|module_param_named' "$DISK"
 
 echo
-sed -n '/ps3disk_scatter_gather/,/^}/p' "$DISK"
-grep -n -B2 -A4 '__fls(dev->accessible_regions)' "$STOR"
+echo "=== ps3stor_lib.c must be untouched ==="
+if grep -q '__fls(dev->accessible_regions)' "$KDIR/drivers/ps3/ps3stor_lib.c"; then
+    echo "WARNING: the old __fls hack is still present. Revert it:" >&2
+    echo "  cd $KDIR && git checkout drivers/ps3/ps3stor_lib.c" >&2
+    exit 1
+fi
+echo "clean"

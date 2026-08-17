@@ -14,6 +14,9 @@
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
 HERE=$(dirname "$0")
 DEV=/dev/ps3dd
+STAMP=/tmp/partition-ok
+
+rm -f "$STAMP"
 
 ROOT_START=2048
 ROOT_END=37748735       # 18.0 GiB
@@ -50,8 +53,18 @@ echo "ps3dd1 should be 18873344"
 echo
 echo "=== mkswap ==="
 mkswap -L ps3swap "${DEV}2"
+
+# Last act of the block. Anything above that exits early skips this, which is
+# how the real status escapes the subshell that `| tee` creates.
+echo ok > "$STAMP"
 } 2>&1 | tee /tmp/partition-out.txt
 
 mount -o remount,rw "$HERE" 2>/dev/null
 cp /tmp/partition-out.txt "$HERE/partition-out.txt" 2>/dev/null
 sync
+
+if [ ! -f "$STAMP" ]; then
+    echo "FAILED - see partition-out.txt on the stick" >&2
+    exit 1
+fi
+exit 0

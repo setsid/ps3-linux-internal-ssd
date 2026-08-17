@@ -1,0 +1,23 @@
+# Persistent storage links for PS3 block devices.
+#
+# systemd's 60-persistent-storage.rules matches sd*, sr*, vd*, mmcblk*, cciss*
+# and pmem* only. ps3d* matches none of them, so the blkid builtin never runs,
+# no ID_FS_* properties are set, and /dev/disk is never created at all.
+#
+# Anything that resolves a device by label or UUID through udev then fails.
+# Root by LABEL= still works, because the initramfs resolves labels itself, but
+# the systemd-generated swap unit waits on /dev/disk/by-label/ps3swap and times
+# out after 90 seconds, so swap never activates.
+#
+# This is an upstream systemd gap rather than a kernel or patch problem, and it
+# affects any PS3 running a modern systemd. Numbered 61 so it runs after
+# 60-persistent-storage.rules.
+#
+# Install to /etc/udev/rules.d/61-ps3-persistent-storage.rules.
+
+ACTION=="remove", GOTO="ps3_end"
+SUBSYSTEM!="block", GOTO="ps3_end"
+KERNEL=="ps3d*", IMPORT{builtin}="blkid"
+KERNEL=="ps3d*", ENV{ID_FS_UUID_ENC}=="?*", SYMLINK+="disk/by-uuid/$env{ID_FS_UUID_ENC}"
+KERNEL=="ps3d*", ENV{ID_FS_LABEL_ENC}=="?*", SYMLINK+="disk/by-label/$env{ID_FS_LABEL_ENC}"
+LABEL="ps3_end"

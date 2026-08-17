@@ -5,12 +5,17 @@ correctly and assumes a userland from around 2009.
 
 ```
 git clone https://git.kernel.org/pub/scm/linux/kernel/git/geoff/ps3-linux.git ~/ps3-linux
-cd ~/ps3-linux
-make ARCH=powerpc ps3_defconfig
-../scripts/kernel-patch.sh
-../scripts/kernel-config.sh
-make ARCH=powerpc CROSS_COMPILE=powerpc64-linux-gnu- -j$(nproc)
+make -C ~/ps3-linux ARCH=powerpc ps3_defconfig
+./scripts/kernel-patch.sh ~/ps3-linux
+./scripts/kernel-config.sh ~/ps3-linux
+make -C ~/ps3-linux ARCH=powerpc CROSS_COMPILE=powerpc64-linux-gnu- -j$(nproc)
 ```
+
+Run these from the root of this repository, as the README steps do.
+
+A bare `make`, not `make vmlinux`. The bare target builds `vmlinux` and the
+modules together; `vmlinux` alone skips modules entirely, and the install step
+then has nothing to install.
 
 Apply the config script once, after `ps3_defconfig`. Re-running `ps3_defconfig`
 discards everything.
@@ -59,17 +64,33 @@ Required for `systemd-udevd`, `PrivateTmp=`, and most service sandboxing.
 
 ## Version string
 
-`.scmversion` was dropped from kbuild in 5.19. A patched tree therefore builds
-as `-dirty`, `/lib/modules` no longer matches `uname -r`, and no module loads.
+`.scmversion` was dropped from kbuild in 5.19. With `CONFIG_LOCALVERSION_AUTO`
+left on, a patched tree builds as `-dirty`, `/lib/modules` no longer matches
+`uname -r`, and no module loads.
+
+`kernel-config.sh` therefore disables it:
 
 ```
-CONFIG_LOCALVERSION="-your-suffix"
 # CONFIG_LOCALVERSION_AUTO is not set
 ```
 
-A trailing `+` may still appear when HEAD is not on an exact tag. Harmless, as
-long as `make modules_install` runs after the final build so the directory name
-matches.
+and sets nothing else. It does **not** set `CONFIG_LOCALVERSION` — the release
+string is whatever the tree already produces, and the only thing that matters
+is that you read it rather than guess it:
+
+```
+make -s kernelrelease
+```
+
+That string is the directory name under `/lib/modules`, and it is the argument
+`mkinitramfs` needs in README step 4. A trailing `+` appears when HEAD is not on
+an exact tag, and it is part of the string — `6.4.0+` and `6.4.0` are different
+directories. Copy what `kernelrelease` prints, including any `+`.
+
+Set `CONFIG_LOCALVERSION="-something"` yourself if you want a distinguishable
+suffix, but it is optional. Whatever you choose, re-read `kernelrelease`
+afterwards, and run `make modules_install` after the final build so the
+directory name matches.
 
 ## Size
 
@@ -85,8 +106,17 @@ That gets it to roughly 19 MB.
 ## Verifying both patches survived a rebuild
 
 ```
-grep -q 'offset += bvec.bv_len' drivers/block/ps3disk.c && echo ps3disk ok
-grep -q '__fls(dev->accessible_regions)' drivers/ps3/ps3stor_lib.c && echo ps3stor ok
+grep -q 'offset += bvec.bv_len'      drivers/block/ps3disk.c && echo 0001 ok
+grep -q 'ps3disk_find_otheros_region' drivers/block/ps3disk.c && echo 0002 ok
+```
+
+Both patches touch only `drivers/block/ps3disk.c`. If
+`drivers/ps3/ps3stor_lib.c` differs from upstream, something has gone wrong —
+the earlier `__fls` hack was withdrawn, not superseded:
+
+```
+grep -q '__fls(dev->accessible_regions)' drivers/ps3/ps3stor_lib.c \
+    && echo "stale __fls hack, revert this file"
 ```
 
 Worth doing before every build. A `make mrproper` or a tree update will remove
