@@ -106,6 +106,16 @@ in_chroot_tty() {
     LC_ALL=C chroot "$ROOTFS" "$@"
 }
 
+# systemctl is being asked about a root filesystem that is not running, while
+# /proc and /sys here belong to the build host. SYSTEMD_OFFLINE=1 is the
+# documented way to say so: it stops systemctl consulting the running manager
+# and silences the "/proc/ is not mounted" warning, whichever way the binds
+# happen to be at the time.
+in_chroot_offline() {
+    DEBIAN_FRONTEND=noninteractive LC_ALL=C SYSTEMD_OFFLINE=1 \
+        chroot "$ROOTFS" "$@"
+}
+
 echo "=== stage 1: debootstrap $SUITE/$ARCH into $ROOTFS ==="
 mkdir -p "$ROOTFS"
 debootstrap --foreign --arch="$ARCH" --keyring="$KEYRING" \
@@ -231,16 +241,41 @@ in_chroot adduser "$USERNAME" sudo
 # machine comes up reachable over SSH on DHCP, and if networkd is not actually
 # enabled the user boots a PS3 with no network and no way in except a
 # television, after being told the build succeeded. Check the symlinks.
-in_chroot systemctl enable ssh || true
-in_chroot systemctl enable systemd-networkd || true
-in_chroot systemctl enable systemd-resolved || true
+# Full unit names: bare "ssh" is ambiguous now that openssh ships an ssh.socket
+# alongside ssh.service.
+in_chroot_offline systemctl enable ssh.service || true
+in_chroot_offline systemctl enable systemd-networkd.service || true
+in_chroot_offline systemctl enable systemd-resolved.service || true
+
+# Enabled means systemd says so, or a wants symlink points at a unit file that
+# exists. Resolve that target inside the tree: the symlinks systemd writes are
+# absolute, so testing one from the build host with [ -e ] follows it into the
+# host's own /usr/lib/systemd/system. That silently passes for every unit the
+# host happens to have installed and fails for the ones it does not - which is
+# how a correctly enabled ssh.service came back as NOT enabled on a host with
+# systemd but no openssh-server, while networkd and resolved passed.
+unit_enabled() { # unit_enabled <unit>
+    local l t
+    [ "$(in_chroot_offline systemctl is-enabled "$1" 2>/dev/null)" = enabled ] \
+        && return 0
+    for l in "$ROOTFS/etc/systemd/system"/*.target.wants/"$1"; do
+        [ -L "$l" ] || continue
+        t=$(readlink "$l")
+        case "$t" in
+            /*) [ -e "$ROOTFS$t" ] && return 0 ;;
+            *)  [ -e "${l%/*}/$t" ] && return 0 ;;
+        esac
+    done
+    return 1
+}
 
 echo
 echo "=== checking services are really enabled ==="
-WANTS="$ROOTFS/etc/systemd/system/multi-user.target.wants"
+# The glob in unit_enabled covers every *.target.wants, so resolved linking from
+# sysinit rather than multi-user needs no special case here.
 missing=
-for unit in ssh.service systemd-networkd.service; do
-    if [ -e "$WANTS/$unit" ]; then
+for unit in ssh.service systemd-networkd.service systemd-resolved.service; do
+    if unit_enabled "$unit"; then
         echo "  $unit enabled"
     else
         echo "  $unit NOT enabled"
@@ -248,20 +283,15 @@ for unit in ssh.service systemd-networkd.service; do
     fi
 done
 
-# resolved links from a different target on some versions; check both.
-if [ -e "$WANTS/systemd-resolved.service" ] \
-   || [ -e "$ROOTFS/etc/systemd/system/sysinit.target.wants/systemd-resolved.service" ]; then
-    echo "  systemd-resolved.service enabled"
-else
-    echo "  systemd-resolved.service NOT enabled"
-    missing="$missing systemd-resolved.service"
-fi
-
 if [ -n "$missing" ]; then
     echo
     echo "FAILED: these services are not enabled:$missing"
     echo "The machine would boot without them. Fix before building an image:"
-    echo "  chroot $ROOTFS systemctl enable$missing"
+    echo "  SYSTEMD_OFFLINE=1 chroot $ROOTFS systemctl enable$missing"
+    echo
+    echo "The tree itself is built and nothing above this is lost. After that"
+    echo "command, run make-debian-installer.sh again - it resumes from what is"
+    echo "already done and will not rebuild the tree."
     exit 1
 fi
 
