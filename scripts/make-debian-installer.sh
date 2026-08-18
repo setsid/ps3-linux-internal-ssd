@@ -930,11 +930,16 @@ trap 'stop_all_watches; cleanup_stick; ui_end; ui_cleanup; hand_over_all' EXIT
 # offered at all, because the failure mode is writing over the wrong disk.
 declare -a CAND_ID CAND_LABEL CAND_SIZE CAND_FS CAND_FREE
 
+SCAN_WHY=""
 scan_removable() {
     CAND_ID=(); CAND_LABEL=(); CAND_SIZE=(); CAND_FS=(); CAND_FREE=()
+    SCAN_WHY=""
     if [ "$IS_WSL" = 1 ]; then
         local ps out try
-        ps=$(find_powershell) || return 1
+        # Say which of the two it was. Both used to print the same "looked for
+        # powershell" message, so a scan that ran fine and simply found no
+        # removable drive read as a missing interpreter.
+        ps=$(find_powershell) || { SCAN_WHY=no-powershell; return 1; }
         # powershell.exe on WSL is slow to come up cold and the first call can
         # return nothing. Retrying is what made it work when pressed twice by
         # hand; do it here instead of leaving the user to guess.
@@ -949,6 +954,7 @@ scan_removable() {
             CAND_SIZE+=("${size:-0}"); CAND_FS+=("${fs:-?}")
             CAND_FREE+=("${free:-0}")
         done <<< "$out"
+        [ -n "$out" ] || SCAN_WHY=powershell-no-output
     else
         local name rm size fs label mnt free
         while read -r name rm size fs label mnt; do
@@ -963,7 +969,23 @@ scan_removable() {
         done < <(lsblk -rno NAME,RM,SIZE,FSTYPE,LABEL,MOUNTPOINT --bytes 2>/dev/null \
                  | awk 'NF>=3')
     fi
-    [ "${#CAND_ID[@]}" -gt 0 ]
+    if [ "${#CAND_ID[@]}" -gt 0 ]; then
+        return 0
+    fi
+    [ -n "$SCAN_WHY" ] || SCAN_WHY=none-removable
+    return 1
+}
+
+# Nothing may be written to anything that is not a mounted stick. The scan will
+# not list a non-removable device, but that only protects the paths that go
+# through it - and an unset STICK_MNT turns "$STICK_MNT/$IMG_GZ_NAME" into an
+# absolute path on the build host, so the image lands on / instead of failing.
+stick_is_mounted() {
+    [ -n "${STICK_MNT:-}" ] || return 1
+    [ "$STICK_MNT" != / ] || return 1
+    [ -d "$STICK_MNT" ] || return 1
+    mountpoint -q "$STICK_MNT" 2>/dev/null && return 0
+    awk -v m="$STICK_MNT" '$2 == m { found = 1 } END { exit !found }' /proc/mounts
 }
 
 human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}"; }
@@ -972,15 +994,24 @@ choose_stick() {
     local need=$1 i sel
     while :; do
         if ! scan_removable; then
-            if [ "$IS_WSL" = 1 ]; then
-                warn "No removable drives found."
-                warn "On WSL this needs powershell.exe to tell a USB stick from"
-                warn "your system disk. Without it there is no safe way to"
-                warn "enumerate, so nothing is offered."
-                warn "Looked for it on PATH and under $(windows_root 2>/dev/null || echo '/mnt/c')."
-            else
-                warn "No removable drives found."
-            fi
+            case "$SCAN_WHY" in
+                no-powershell)
+                    warn "No removable drives found: powershell.exe not found."
+                    warn "On WSL it is what tells a USB stick from your system"
+                    warn "disk. Without it there is no safe way to enumerate, so"
+                    warn "nothing is offered."
+                    warn "Looked on PATH and under $(windows_root 2>/dev/null || echo '/mnt/c')."
+                    ;;
+                powershell-no-output)
+                    warn "No removable drives found: powershell.exe ran but"
+                    warn "returned nothing, three times. Either no removable"
+                    warn "drive is attached, or the query failed."
+                    ;;
+                *)
+                    warn "No removable drives found. Nothing removable is attached,"
+                    warn "or it has no filesystem the host can see."
+                    ;;
+            esac
         else
             echo
             echo "${B}Removable drives${N}   ${D}(only removable devices are listed)${N}"
@@ -1052,7 +1083,9 @@ do_stick() {
     local imgsize
     imgsize=$(stat -c %s "$IMG" 2>/dev/null) || fail "no image at $IMG"
 
-    choose_stick "$((imgsize / 3))"
+    choose_stick "$((imgsize / 3))" || fail "no removable drive was selected"
+    stick_is_mounted \
+        || fail "no stick is mounted at '${STICK_MNT:-}' - refusing to write"
 
     echo
     echo "${B}Selected:${N} $STICK_DESC"
