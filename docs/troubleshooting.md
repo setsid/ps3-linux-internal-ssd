@@ -245,13 +245,22 @@ not.
 
 Evilnat 4.93 reserves a fixed 46137320 sectors, about 22 GiB, for OtherOS
 regardless of drive size. Confirmed identical on a 320 GB HDD and a 960 GB SSD.
-`scripts/partition-region.sh` splits it 18 GiB root plus the remainder as swap:
+
+`scripts/partition-region.sh` does not hardcode that. It measures the region and
+derives the layout: a fixed root of `ROOT_GIB` gigabytes, default 18, and the
+remainder as swap less the 34 sectors parted keeps for the GPT backup header. On
+the standard region that produces exactly:
 
 ```
 parted -s /dev/ps3dd unit s mklabel gpt
 parted -s /dev/ps3dd unit s mkpart primary ext2 2048s 37748735s
 parted -s /dev/ps3dd unit s mkpart primary linux-swap 37748736s 46137286s
 ```
+
+On any other size it produces the right numbers for that size instead. It
+refuses outright if the region is outside 8–128 GiB, which is what stops it
+partitioning region 0 — the whole physical drive — and it refuses if `ROOT_GIB`
+would leave less than 512 MiB for swap, suggesting a value that fits.
 
 Use explicit sectors with the `s` suffix. Petitboot's `parted` mishandles `GiB`
 and `%`: `18GiB` produced a 6 GiB partition and `100%` produced 10 GiB.

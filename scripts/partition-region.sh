@@ -12,12 +12,16 @@
 # Region geometry as created by glevand's create_hdd_region.sh on Evilnat
 # 4.93: 46137320 sectors, fixed regardless of drive size.
 #
-# That figure is checked, not assumed. This script writes a partition table,
-# and on a console whose firmware presents a different layout the assumption
-# would destroy whatever is actually there, unrecoverably. If you knowingly
-# have a different region size, override it:
+# The layout is derived from the region's measured size rather than hardcoded,
+# so a region of another size is partitioned correctly instead of being either
+# refused or silently mangled. On the standard 46137320-sector region the
+# derivation reproduces the documented numbers exactly: root 2048-37748735,
+# swap 37748736-46137286.
 #
-#   EXPECTED_SECTORS=12345678 sh partition-region.sh
+# Root is a fixed size, swap gets the remainder. Override the root size if you
+# want a different split:
+#
+#   ROOT_GIB=12 sh partition-region.sh
 
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
 HERE=$(dirname "$0")
@@ -57,8 +61,18 @@ have_partitions() {
 
 rm -f "$STAMP"
 
-# Override on the command line if your layout differs and you know it does.
-EXPECTED_SECTORS="${EXPECTED_SECTORS:-46137320}"
+ROOT_GIB="${ROOT_GIB:-18}"
+
+SECTORS_PER_GIB=2097152
+STANDARD_SECTORS=46137320   # Evilnat 4.93, for reporting only
+GPT_TAIL=34                 # parted keeps the backup header in the last sectors
+MIN_SWAP_SECTORS=1048576    # 512 MiB - below this, do not bother
+
+# A sanity envelope rather than an exact figure. It is wide enough for any
+# plausible OtherOS region and narrow enough that pointing this at region 0,
+# the whole 915 GB drive, is refused rather than partitioned.
+MIN_REGION_SECTORS=$((8 * SECTORS_PER_GIB))
+MAX_REGION_SECTORS=$((128 * SECTORS_PER_GIB))
 
 # blockdev is not always present at the petitboot shell; sysfs always is.
 dev_sectors() {
@@ -68,9 +82,6 @@ dev_sectors() {
 }
 
 ROOT_START=2048
-ROOT_END=37748735       # 18.0 GiB
-SWAP_START=37748736
-SWAP_END=46137286       # end of usable space
 
 {
 echo "=== paths ==="
@@ -101,7 +112,6 @@ for d in ps3da ps3db ps3dc ps3dd; do
 done
 
 ACTUAL=$(dev_sectors) || ACTUAL=""
-echo "  $DEV is ${ACTUAL:-unknown} sectors, expected $EXPECTED_SECTORS"
 
 if [ -z "$ACTUAL" ]; then
     echo
@@ -110,19 +120,43 @@ if [ -z "$ACTUAL" ]; then
     exit 1
 fi
 
-if [ "$ACTUAL" != "$EXPECTED_SECTORS" ]; then
+echo "  $DEV is $ACTUAL sectors"
+
+if [ "$ACTUAL" -lt "$MIN_REGION_SECTORS" ] || [ "$ACTUAL" -gt "$MAX_REGION_SECTORS" ]; then
     echo
     echo "REFUSING TO CONTINUE"
-    echo "$DEV is $ACTUAL sectors, expected $EXPECTED_SECTORS."
+    echo "$DEV is $ACTUAL sectors, outside the range this script will touch"
+    echo "($MIN_REGION_SECTORS to $MAX_REGION_SECTORS, i.e. 8 GiB to 128 GiB)."
     echo
-    echo "This does not look like the OtherOS region this script was written"
-    echo "for, and partitioning it would destroy whatever is there. Nothing"
-    echo "has been written."
-    echo
-    echo "If your layout really is different and you know the size is right:"
-    echo "  EXPECTED_SECTORS=$ACTUAL sh \$0"
+    echo "An OtherOS region is not that size. If this is region 0 - the whole"
+    echo "physical drive - partitioning it would destroy GameOS. Nothing has"
+    echo "been written."
     exit 1
 fi
+
+# Derive the layout from what is actually there.
+ROOT_SECTORS=$((ROOT_GIB * SECTORS_PER_GIB))
+ROOT_END=$((ROOT_SECTORS - 1))
+SWAP_START=$ROOT_SECTORS
+SWAP_END=$((ACTUAL - GPT_TAIL))
+
+if [ "$SWAP_END" -le "$((SWAP_START + MIN_SWAP_SECTORS))" ]; then
+    echo
+    echo "REFUSING TO CONTINUE"
+    echo "A ${ROOT_GIB} GiB root leaves no room for swap in $ACTUAL sectors."
+    echo "Use a smaller root, for example:"
+    echo "  ROOT_GIB=$(( (ACTUAL - MIN_SWAP_SECTORS - GPT_TAIL) / SECTORS_PER_GIB )) sh \$0"
+    echo "Nothing has been written."
+    exit 1
+fi
+
+if [ "$ACTUAL" = "$STANDARD_SECTORS" ]; then
+    echo "  standard Evilnat OtherOS region"
+else
+    echo "  non-standard region size - layout derived from it, not assumed"
+fi
+echo "  root: ${ROOT_START}s to ${ROOT_END}s (${ROOT_GIB} GiB)"
+echo "  swap: ${SWAP_START}s to ${SWAP_END}s ($(( (SWAP_END - SWAP_START + 1) / 2048 )) MiB)"
 
 echo
 echo "=== unmounting ==="
@@ -173,7 +207,7 @@ fi
 echo
 echo "=== kernel view ==="
 grep ps3dd /proc/partitions
-echo "ps3dd1 should be 18873344"
+echo "ps3dd1 should be $(( (ROOT_END - ROOT_START + 1) / 2 ))"
 
 # Only swap gets formatted here. The root filesystem is written as a whole
 # image built on the development machine - petitboot's e2fsprogs is 1.41.12

@@ -36,11 +36,15 @@ REGNAME=ps3dd
 
 # The md5 pass afterwards catches a bad write. It does not catch a write to the
 # right-looking name on the wrong layout, because by then the data is gone. So
-# check the geometry first and write nothing on a mismatch. Override if you
-# knowingly have a different region size.
-EXPECTED_SECTORS="${EXPECTED_SECTORS:-46137320}"
-ROOT_MIN_SECTORS="${ROOT_MIN_SECTORS:-36000000}"   # ~17.2 GiB
-ROOT_MAX_SECTORS="${ROOT_MAX_SECTORS:-39000000}"   # ~18.6 GiB
+# check the target first and write nothing on a mismatch.
+#
+# A range rather than an exact size: partition-region.sh derives its layout from
+# the region it finds, so the region need not be the standard 46137320 sectors.
+# The envelope is wide enough for any plausible OtherOS region and narrow enough
+# that region 0, the whole drive, is refused.
+SECTORS_PER_GIB=2097152
+MIN_REGION_SECTORS=$((8 * SECTORS_PER_GIB))
+MAX_REGION_SECTORS=$((128 * SECTORS_PER_GIB))
 
 dev_sectors() {
     blockdev --getsz "$1" 2>/dev/null && return 0
@@ -111,24 +115,27 @@ echo
 echo "=== checking the target ==="
 RSEC=$(dev_sectors "$REGION" "$REGNAME") || RSEC=""
 PSEC=$(dev_sectors "$DEV" "${REGNAME}1") || PSEC=""
-echo "$REGION: ${RSEC:-unknown} sectors, expected $EXPECTED_SECTORS"
-echo "$DEV: ${PSEC:-unknown} sectors, expected $ROOT_MIN_SECTORS-$ROOT_MAX_SECTORS"
+echo "$REGION: ${RSEC:-unknown} sectors"
+echo "$DEV: ${PSEC:-unknown} sectors"
 
-if [ "$RSEC" != "$EXPECTED_SECTORS" ]; then
+if [ -z "$RSEC" ] || [ "$RSEC" -lt "$MIN_REGION_SECTORS" ] \
+   || [ "$RSEC" -gt "$MAX_REGION_SECTORS" ]; then
     echo
-    echo "This does not look like the expected OtherOS++ layout."
-    echo "Expected $REGION = $EXPECTED_SECTORS sectors"
+    echo "This does not look like an OtherOS region."
+    echo "Expected $REGION between $MIN_REGION_SECTORS and $MAX_REGION_SECTORS"
+    echo "sectors, i.e. 8 GiB to 128 GiB."
     echo "Found    $REGION = ${RSEC:-unknown} sectors"
     echo "Nothing has been written."
     exit 1
 fi
 
-if [ -z "$PSEC" ] || [ "$PSEC" -lt "$ROOT_MIN_SECTORS" ] \
-   || [ "$PSEC" -gt "$ROOT_MAX_SECTORS" ]; then
+# The image has to fit in the partition it is being written to.
+NEED=$((MB * 2048))
+if [ -z "$PSEC" ] || [ "$PSEC" -lt "$NEED" ]; then
     echo
-    echo "$DEV is ${PSEC:-unknown} sectors, not the ~18 GiB root partition"
-    echo "this image is built for. Run partition-region.sh first and let it"
-    echo "finish cleanly."
+    echo "$DEV is ${PSEC:-unknown} sectors, too small for a $MB MiB image"
+    echo "which needs $NEED sectors."
+    echo "Run partition-region.sh first and let it finish cleanly."
     echo "Nothing has been written."
     exit 1
 fi
