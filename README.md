@@ -3,13 +3,12 @@
 Patches, scripts and notes for running Debian sid ppc64 from the internal drive
 of a PS3 under OtherOS++, on a 6.4 kernel, alongside a working GameOS install.
 Existing guides for modern kernels put the root filesystem on external USB,
-which sidesteps two bugs in the PS3 storage path. Both are fixed here. The
-result is a machine that boots Debian from the OtherOS region, sees every
-storage region the hypervisor exposes, and cannot accidentally write to the
-GameOS ones.
+which sidesteps two bugs in the PS3 storage path. Both are fixed here, so
+Debian boots from the OtherOS region, every region the hypervisor exposes is
+visible, and the GameOS regions are read-only.
 
-**In a hurry? One script does the host side: [The easy way](#the-easy-way).**
-The numbered steps after it are reference, not homework.
+One script does the host side: [The easy way](#the-easy-way). The numbered
+steps after it are reference.
 
 > **Upgrading from v1: your root device is renamed and this will stop the
 > machine booting.** The OtherOS region moves from `/dev/ps3da` to
@@ -30,8 +29,7 @@ The numbered steps after it are reference, not homework.
 
 ## The easy way
 
-**One script on the host, two at the console, then reboot. That is the whole
-process.** Nothing below this section is required reading.
+One script on the host, two at the console, then reboot.
 
 On the host machine, from the root of this repository:
 
@@ -42,9 +40,9 @@ sudo ./scripts/make-debian-installer.sh
 It works out what is already done, shows you a checklist, and offers to run
 everything outstanding, the rebuild loop only, or a single step. It pauses
 before each step to say what it is about to do and roughly how long that takes,
-keeps the real command output on screen and logs all of it unfiltered to a
-file, and picks the USB stick for you from the removable devices it can find.
-Non-removable disks are never offered.
+keeps the command output on screen and logs it to a file, and picks the USB
+stick from the removable devices it can find. Non-removable disks are never
+offered.
 
 Then, at the petitboot shell on the console:
 
@@ -53,18 +51,15 @@ sh /tmp/petitboot/mnt/sda1/partition-region.sh    # first time only
 sh /tmp/petitboot/mnt/sda1/write-image.sh
 ```
 
-Reboot, choose **debian** — not `debian-failsafe` — and you have Debian.
+Reboot and choose **debian**, not `debian-failsafe`.
 
 `write-image.sh` needs no arguments — the tool writes a `manifest.txt` to the
 stick with the image name, hash, size and kernel release, and the script reads
-it. That is the last thing anyone had to transcribe by hand: a 32-character
-hash, typed at a television, on a USB keyboard, late at night.
+it.
 
 **How long.** First run is around 90 minutes: about 20 for debootstrap, 15 or
 more for the kernel depending on cores, the rest in image build, transfer and
-write. The rebuild loop afterwards is under 15 minutes. If you have been told
-45 minutes and a step sits there for 20, you will assume it has hung and kill
-it — it has not.
+write. The rebuild loop afterwards is under 15 minutes.
 
 `--plain` turns off the cursor addressing, colour and progress bars and behaves
 exactly as the individual scripts do. That happens automatically when output is
@@ -76,15 +71,13 @@ skips straight to build, transfer, write.
 
 Everything from here on is reference: what that tool is doing, how to do it by
 hand when something goes wrong in the middle, and why the two kernel patches
-exist. You do not need any of it to get a working machine.
+exist.
 
 ## The long way: the steps, one at a time
 
-`make-debian-installer.sh` runs exactly these. They are the documentation of
-what it is doing, and the fallback when a step fails and you want to pick up
-from the middle. It calls the same scripts these steps call — it is a driver,
-not a reimplementation. If the two ever disagree, the scripts are right and the
-tool is the bug.
+`make-debian-installer.sh` runs exactly these, and they are the fallback when a
+step fails and you want to pick up from the middle. It calls the same scripts
+these steps call rather than reimplementing them.
 
 Every command below runs from the root of this repository, so script paths are
 relative to it. `~/ps3-linux` is the kernel tree from step 1 — adjust it
@@ -96,13 +89,11 @@ itself.
 
 **Steps 0 to 4 and 7 are done once. Steps 5, 6, 8 and 9 are the rebuild loop.**
 Once the kernel is installed and the region is partitioned, iterating means
-build the image, copy it to the stick, write it, reboot — and nothing above
-that needs re-reading.
+build the image, copy it to the stick, write it, reboot.
 
 Which loop depends on what you changed. A userland change is 5, 6, 8, 9. A
 kernel change is 3, 4, 5, 6, 8, 9 — steps 3 and 4 first, or step 5 packages a
-tree that still contains the old `vmlinux` and you spend forty minutes writing
-and booting the kernel you were trying to replace.
+tree that still contains the old `vmlinux`.
 
 **Steps 0 and 1–3 are independent tracks.** One builds a Debian userland, the
 other builds a kernel. They share nothing and can run in either order, or at
@@ -129,27 +120,24 @@ label, and installs the udev rule described below. Everything after this
 assumes the tree exists at `/srv/ps3root`.
 
 It produces the userland only. No kernel, no modules, no initrd — those are
-step 4, which is the one place in this sequence that installs a kernel. It
-depends on nothing above it, so it can run before, after or alongside steps 1
-to 3.
+step 4, the one place in this sequence that installs a kernel. It depends on
+nothing above it, so it can run before, after or alongside steps 1 to 3.
 
 Takes about 20 minutes under emulation on an 8-core host, most of it
 debootstrap running package scripts for a big-endian PowerPC target. The
 resulting tree is around 721 MB.
 
 **You set your own passwords.** The script prompts twice during the run, once
-for root and once for the user it creates. **This repository ships no
-credentials of any kind** — no passwords, no keys, no accounts, and no SSH host
-or user keys. Nothing you install here inherits anyone else's, and nothing is
-defaulted.
+for root and once for the user it creates. This repository ships no credentials
+of any kind — no passwords, keys, accounts or SSH host keys.
 
 **SSH is enabled and the machine comes up reachable.** `ssh.service` is on and
-`systemd-networkd` takes a DHCP address as `eth0`, so after first boot you can
-log in over the network rather than hunting for a television and a keyboard.
+`systemd-networkd` takes a DHCP address as `eth0`, so you can log in over the
+network after first boot.
 
-That also means the box is exposed on your LAN from first boot. Debian's `sshd`
-permits password authentication for normal users, so a weak password is the
-whole of the exposure. Once you are in, install a key and turn passwords off:
+That also means the box is exposed on your LAN from first boot, and Debian's
+`sshd` permits password authentication for normal users. Once you are in,
+install a key and turn passwords off:
 
 ```
 ssh-copy-id <user>@<address>
@@ -172,10 +160,9 @@ git clone https://git.kernel.org/pub/scm/linux/kernel/git/geoff/ps3-linux.git ~/
 The script prints the patched code back so you can see it landed. It also fails
 if `drivers/ps3/ps3stor_lib.c` still carries the withdrawn v1 hack.
 
-**On a newer kernel, `0001` may do nothing, and that is correct.** René Rebe's
-bounce buffer fix was posted upstream in November 2025. It is absent at `v6.17`,
-so anything from roughly 6.18 onward already carries it. Check rather than
-assume:
+**On a newer kernel, `0001` may do nothing.** René Rebe's bounce buffer fix was
+posted upstream in November 2025. It is absent at `v6.17`, so anything from
+roughly 6.18 onward already carries it. Check before applying it:
 
 ```
 grep -n 'offset += bvec.bv_len' drivers/block/ps3disk.c
@@ -237,9 +224,9 @@ directory name, and `6.4.0+` and `6.4.0` are different directories.
 
 Do not copy a release string out of this document. What you get depends on the
 tree: `kernel-config.sh` turns `CONFIG_LOCALVERSION_AUTO` off and sets no
-suffix of its own, so a fresh clone gives a bare `6.4.0+`, while a tree that has
-been built before under different settings may give something longer. The
-authority is the tree in front of you:
+suffix of its own, so a fresh clone gives a bare `6.4.0+`, while a tree built
+before under different settings may give something longer. Read it from the
+tree:
 
 ```
 make -s -C ~/ps3-linux ARCH=powerpc CROSS_COMPILE=powerpc64-linux-gnu- kernelrelease
@@ -258,8 +245,7 @@ for the old one.
 
 The initrd is also why the emergency shell has a keyboard. `mkinitramfs` did
 not pull USB HID or the host controllers in, so `kernel-config.sh` builds them
-into the kernel instead. An initramfs prompt you cannot type at is useless on a
-machine whose only console is a television.
+into the kernel instead.
 
 Watch the total size. About 19 MB of `vmlinux` plus about 15 MB of initrd is
 34 MB that petitboot has to kexec into 256 MB of RAM, alongside itself.
@@ -279,16 +265,16 @@ md5sum /tmp/ps3root4g.img
 Keep that md5; step 8 needs it.
 
 Populate with `cp -a`, never `mke2fs -d`. A `-d` built image passed `e2fsck -fn`
-cleanly and contained an almost empty `/usr` — one directory in it. That cost
-hours, and it fails at `run-init` rather than at build time.
+cleanly and contained an almost empty `/usr` — one directory in it. It fails at
+`run-init` rather than at build time.
 
 Build on the host, not on the console: petitboot's `mke2fs` is from 2010 and
 writes group descriptors the 6.4 ext4 driver rejects outright.
 
-1048576 blocks of 4 KiB is 4 GiB. The region holds 18 GiB, but 4 is ample — the
-tree is around 721 MB and the finished filesystem uses 875 MB — and it quarters
-both the write and the verify. Grow it later
-from inside Debian with `resize2fs`.
+1048576 blocks of 4 KiB is 4 GiB. The region holds 18 GiB, but 4 is enough —
+the tree is around 721 MB and the finished filesystem uses 875 MB — and it
+quarters both the write and the verify. Grow it later from inside Debian with
+`resize2fs`.
 
 `scripts/build-image.sh` is the same sequence scripted, with an `e2fsck` pass
 at the end.
@@ -309,8 +295,8 @@ run them from there.
 Put the stick in the **rightmost USB port on the front of the console**. That
 gives `sda1` consistently on a CECH-2503B regardless of what else is attached,
 which is what makes the paths in steps 7 and 8 predictable. Enumeration order
-is not guaranteed in general, so both scripts print the path they actually
-resolved to as their first output — check it if anything looks wrong.
+is not guaranteed in general, so both scripts print the path they resolved to
+as their first output.
 
 `gzip -1` deliberately. The image is mostly zeroes, so it comes out around
 525 MB at any level, and `-1` is much faster. `drvfs` is the WSL driver for
@@ -349,9 +335,8 @@ the first 4096 MiB of it.
 
 It writes with a plain redirect rather than piping into `dd`, because busybox
 `dd` has no `iflag=fullblock` and silently truncates a gzip stream, then reads
-the region back and compares the hash before it will go on to check the
-contents. Both petitboot scripts log to the USB stick, since getting text off
-the console otherwise means photographing a television.
+the region back and compares the hash before checking the contents. Both
+petitboot scripts log to the USB stick.
 
 **9. Reboot and select Debian.** *(rebuild loop)* Check `dmesg | grep ps3disk`
 on first boot; the line to look for is `OtherOS region is region 3`. Expected
@@ -404,8 +389,7 @@ upstream catches up.
 
 ## Verified state
 
-What has actually run on hardware, so nobody assumes more testing than has
-happened:
+What has actually run on hardware:
 
 | | |
 |---|---|
@@ -415,14 +399,14 @@ happened:
 | `build-image.sh`, `partition-region.sh` | Run. Produced the image and partition table now on the console |
 | `write-image.sh` | Run. Wrote and verified the image now on the console |
 | `build-rootfs.sh` | Run. Built the tree that boots |
-| `make-debian-installer.sh` | **Not run end to end.** Written after the dry run. Its state detection, progress polling, removable-device scan and menus are tested; a full run through it is not. It calls the scripts above rather than reimplementing them, so what it drives is verified even where the driver is not |
+| `make-debian-installer.sh` | **Not run end to end.** Written after the dry run. Its state detection, progress polling, removable-device scan and menus are tested; a full run through it is not. It calls the scripts above rather than reimplementing them, so the steps it drives are verified |
 
 **Every script in this repository has run on hardware, in the order above.** A
 full dry run went from a clean machine to booting Debian: a fresh tree at
 `/srv/ps3root-test`, kernel and modules installed into it, image built,
 partitioned and written at petitboot, booted.
 
-Numbers from that run, which are the ones to expect:
+Numbers from that run:
 
 | | |
 |---|---|
@@ -439,8 +423,7 @@ with `make -s kernelrelease` rather than expecting either.
 
 The tree is 721 MB rather than the 1.4 GB quoted in earlier notes because
 `build-rootfs.sh` now runs `apt-get clean`. The earlier tree carried every
-`.deb` it had downloaded, and packaging those into the image cost write time on
-every cycle.
+`.deb` it had downloaded.
 
 ## How it works
 
@@ -456,13 +439,12 @@ all but the first.
 Single-segment requests are fine, so the superblock reads correctly and
 anything larger returns repeated data. It presents as ext4 group descriptor
 errors, binaries that exist but will not execute, and a different errno on each
-boot — the nondeterminism is the giveaway, since request segmentation varies
-between boots. `patches/0001` restores the line.
+boot, since request segmentation varies between boots. `patches/0001` restores
+the line.
 
-Petitboot is unaffected: 2.6.30 predates the refactor. Worth knowing before
-moving to a newer kernel, upstream `ps3disk.c` at `v6.17` still has this bug —
-the fix postdates that release, so check for `offset += bvec.bv_len` in
-whatever tree you move to rather than assuming.
+Petitboot is unaffected: 2.6.30 predates the refactor. Upstream `ps3disk.c` at
+`v6.17` still has this bug — the fix postdates that release, so check for
+`offset += bvec.bv_len` in whatever tree you move to.
 
 ### Bug 2: region selection
 
@@ -484,12 +466,10 @@ choosing between them, matching petitboot:
 
 Everything except the OtherOS region is read-only by default. Region 1 is
 roughly 870 GB of games and the filesystem GameOS needs in order to boot at
-all; exposing it read-write one letter away from the root filesystem is not
-worth the convenience, and a partially written GameOS region means a full
-reinstall. The OtherOS region is identified as the highest-numbered accessible
-region that is neither region 0 nor the size of the whole drive.
+all, and a partially written GameOS region means a full reinstall. The OtherOS
+region is identified as the highest-numbered accessible region that is neither
+region 0 nor the size of the whole drive.
 
-Because the other regions are read-only, mounting them is safe to do casually.
 The FAT32 cache region is a useful file transfer path between the two systems:
 
 ```
@@ -506,8 +486,7 @@ It replaces the v1 `__fls` hack, which is withdrawn rather than superseded.
 
 Not upstream, and specific to OtherOS++ layouts. The design rationale, the
 serialisation argument, the write-protection failure modes and the hardware
-verification are in
-[docs/region-handling.md](docs/region-handling.md).
+verification are in [docs/region-handling.md](docs/region-handling.md).
 
 ## Repository contents
 
@@ -532,7 +511,7 @@ the rest in order.
 ## Credit
 
 Written by setsid. `patches/0002`, the documentation and the scripts are mine;
-the work below is other people's and is credited because this builds on it.
+the work below is other people's.
 
 - René Rebe for the `ps3disk` offset fix, and Christoph Hellwig for reviewing it
 - T2 SDE for

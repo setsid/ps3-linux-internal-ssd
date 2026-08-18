@@ -91,10 +91,10 @@ dd if=/dev/ps3dd1 bs=1M count=4096 | md5sum
 dd if=/dev/ps3dd1 bs=1M count=4096 | md5sum
 ```
 
-The two commands are identical on purpose — that is the point. Since `0002`
-both kernels call the region `ps3dd`, so this reads the same bytes off the same
-device through two different drivers. Under v1 the second would have been
-`ps3da1`. Differing hashes on the same bytes is conclusive.
+The two commands are identical on purpose. Since `0002` both kernels call the
+region `ps3dd`, so this reads the same bytes off the same device through two
+different drivers. Under v1 the second would have been `ps3da1`. Differing
+hashes on the same bytes is conclusive.
 
 **`run-init: can't execute '/sbin/init'`.** Check whether `/usr/sbin/init`
 exists before assuming a symlink problem. A `mke2fs -d` built image can pass
@@ -173,9 +173,7 @@ update-initramfs -u
 
 **Not verified** — the dry run did not test it, and the machine boots fine
 without it. The practical impact is that a dirty unmount is never repaired
-automatically; run `fsck` from petitboot if you suspect damage. Left documented
-rather than worked around, because a silently missing fsck is worse than a known
-one.
+automatically; run `fsck` from petitboot if you suspect damage.
 
 **`W: Kernel configuration /boot/config-<release> is missing`.** `modules_install`
 does not place the kernel `.config`, so `mkinitramfs` cannot check for
@@ -224,8 +222,7 @@ under petitboot. From the Debian side it is console output only.
 ## Things that were not the problem
 
 Recorded because each cost at least one rebuild cycle before being ruled out.
-When the storage path is corrupting data, everything above it looks broken, so
-the temptation is to keep changing the filesystem.
+When the storage path is corrupting data, everything above it looks broken.
 
 - filesystem size, block count, or feature flags
 - GPT versus MBR
@@ -270,8 +267,7 @@ For the full region table as the hypervisor reports it, see
 
 ## What has and has not been run
 
-The scripts differ in how much hardware exposure they have had. Worth knowing
-before trusting one unattended.
+The scripts differ in how much hardware exposure they have had.
 
 | Script | State |
 |---|---|

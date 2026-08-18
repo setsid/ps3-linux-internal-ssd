@@ -36,8 +36,7 @@ rather than as a timing problem, which sends you looking at `rootdelay`.
 `CONFIG_USB_EHCI_HCD`, `CONFIG_USB_OHCI_HCD`, `CONFIG_HID`, `CONFIG_USB_HID`
 
 As modules these may not make it into the initramfs, leaving an emergency shell
-you cannot type at. On a machine whose only console is a television that is the
-difference between debugging and reflashing.
+you cannot type at.
 
 ### cgroups
 
@@ -47,8 +46,7 @@ systemd mounts cgroup2 on `/sys/fs/cgroup` as one of its first actions and
 freezes if it cannot. Not optional, and off in `ps3_defconfig`.
 
 Controllers beyond `CGROUPS` itself are not all strictly required for PID 1 to
-survive, but leaving them out produces service failures later that are harder
-to attribute than a missing symbol.
+survive, but leaving them out produces service failures later.
 
 ### namespaces
 
@@ -75,8 +73,7 @@ left on, a patched tree builds as `-dirty`, `/lib/modules` no longer matches
 ```
 
 and sets nothing else. It does **not** set `CONFIG_LOCALVERSION` — the release
-string is whatever the tree already produces, and the only thing that matters
-is that you read it rather than guess it:
+string is whatever the tree already produces, so read it from the tree:
 
 ```
 make -s kernelrelease
@@ -87,8 +84,7 @@ That string is the directory name under `/lib/modules`, and it is the argument
 
 It is not fixed across trees. A clean clone configured by this script gives
 `6.4.0+`; a tree built before under other settings can give something longer.
-Never copy a release string out of documentation — read it from the tree you
-are building.
+Never copy a release string out of documentation.
 
 The trailing `+` appears when HEAD is not on an exact tag and is part of the
 string: `6.4.0+` and `6.4.0` are different directories. Copy what

@@ -52,9 +52,8 @@ So the whole change lives in `drivers/block/ps3disk.c`. `ps3stor_lib.c`,
 `dev->region_idx` keeps its existing meaning for everyone who still uses it.
 `ps3disk` simply stops reading it.
 
-A consequence worth stating: the `__fls` hack is not merely superseded, it is
-withdrawn. `ps3stor_lib.c` goes back to pristine, so `ps3flash` behaves as
-upstream intends again.
+The `__fls` hack is not merely superseded, it is withdrawn. `ps3stor_lib.c`
+goes back to pristine, so `ps3flash` behaves as upstream intends again.
 
 ## Region identity: private data, not minor arithmetic
 
@@ -93,12 +92,11 @@ priv = kzalloc(struct_size(priv, disk, dev->num_regions), GFP_KERNEL);
 `dev->num_regions` is small — four on this hardware — and
 `struct ps3disk_region_priv` is 32 bytes, so the upper-bound allocation costs
 around 128 bytes and saves having to know the exposed count before
-`ps3stor_setup()` has run. That matters on a 256 MB machine only in the sense
-that it is nothing.
+`ps3stor_setup()` has run.
 
 ## Serialisation across regions
 
-This is the part most likely to be wrong, so here is the full argument.
+This is the part most likely to be wrong, so the argument is given in full.
 
 ### The constraint
 
@@ -130,9 +128,8 @@ for a read, after `ps3disk_scatter_gather()` has copied the data out. No
 second request can enter `queue_rq` on any queue in the meantime, because
 there is no second tag.
 
-This is not a novel arrangement. It is exactly how SCSI serialises several
-LUNs behind a host adapter with `can_queue == 1`: one tag set per host, one
-request queue per LUN.
+This is how SCSI serialises several LUNs behind a host adapter with
+`can_queue == 1`: one tag set per host, one request queue per LUN.
 
 Three details that could have broken it, checked against the 6.4 source:
 
@@ -158,18 +155,16 @@ Three details that could have broken it, checked against the 6.4 source:
 
 This should be unreachable. It is there because the failure mode if the
 reasoning above is wrong is silent bounce buffer corruption — the same class of
-bug as the offset regression that patch 0001 fixes, and just as hard to
-attribute. Deferring a request costs 3 ms and one log line; getting it wrong
-costs another 40-minute cycle chasing filesystem corruption.
+bug as the offset regression that patch 0001 fixes. Deferring a request costs
+3 ms and one log line.
 
 The test happens **before** `blk_mq_start_request()`, not after. Starting a
 request tells the block layer the driver has taken it and arms its timeout;
 returning `BLK_STS_DEV_RESOURCE` says the opposite, that it was not taken and
 should be requeued. The block layer copes with the contradiction —
 `blk_mq_handle_dev_resource()` calls `__blk_mq_requeue_request()`, which
-releases the driver tag and resets `rq->state` to `MQ_RQ_IDLE` — but coping is
-not the same as correct, and a backstop that violates the interface in the one
-case it exists for is not worth having. Check first, start second.
+releases the driver tag and resets `rq->state` to `MQ_RQ_IDLE` — but the
+backstop should not depend on that. Check first, start second.
 
 ### Completion
 
@@ -184,8 +179,7 @@ for (i = 0; i < priv->num_disks; i++)
 With the shared tag set this is mostly redundant — freeing the tag wakes a
 waiter through the sbitmap waitqueue — but it is what makes the backstop path
 recover promptly instead of waiting out the 3 ms retry timer. `async = true`,
-so nothing is dispatched inline from interrupt context. Four iterations of a
-cheap call in the completion path is not a cost worth optimising.
+so nothing is dispatched inline from interrupt context.
 
 `priv->num_disks` is only written in probe and remove, when no I/O can be in
 flight, so reading it unlocked in the handler is safe.
@@ -274,10 +268,8 @@ for_each_set_bit(i, &exposed, dev->num_regions) {
    `regions[0]`. This is the fallback when IDENTIFY failed and `raw_capacity`
    is zero.
 
-Plus the flat refusal to ever auto-select index 0.
-
-Three overlapping guards for one decision is deliberate. They are cheap, they
-are independent, and the thing they protect against is unrecoverable.
+Plus the flat refusal to ever auto-select index 0. The three guards are
+independent, so a failure of one does not defeat the others.
 
 ### Is "highest-numbered" sound?
 
@@ -293,12 +285,12 @@ direction elsewhere.
 | IDENTIFY failed | falls back to the id test; may pick nothing | safe |
 | Two custom regions | picks the higher one | probably; check the log |
 
-The third row is the honest failure. If there is no OtherOS region, the
+The third row is the failure case. If there is no OtherOS region, the
 highest non-whole-drive region is the GameOS cache, and it would be exposed
 read-write. The mitigation is that this configuration cannot boot Linux from
 the internal drive in the first place — there is nothing to boot from — and
 the cache region is FAT32 scratch space rather than the UFS2 filesystem GameOS
-needs. It is still worth knowing about.
+needs.
 
 The asymmetry drives the whole design: guessing too permissively can destroy
 data with no warning, guessing too restrictively produces a read-only root
@@ -320,8 +312,8 @@ that `regions=` excluded.
 
 Petitboot's patched 2.6.30 kernel exposes all four regions and names them by
 region index. Matching that means a device path means the same thing in the
-bootloader and in the booted system, which is worth more than it sounds — the
-`ps3da` versus `ps3dd` mismatch introduced by the previous patch cost hours.
+bootloader and in the booted system; the `ps3da` versus `ps3dd` mismatch
+introduced by the previous patch cost hours.
 
 | Region | Name | Contents |
 |---|---|---|
@@ -505,8 +497,7 @@ dd: error writing '/dev/ps3db': Operation not permitted
 0 bytes copied
 ```
 
-Zero bytes written. That is the guard between a mistyped device letter and a
-GameOS reinstall.
+Zero bytes written.
 
 ### Concurrent reads across regions
 
@@ -556,12 +547,10 @@ usable file transfer path between the two systems:
 mount -o ro /dev/ps3dc /mnt/gameos-cache
 ```
 
-Read-only by default is what makes this safe to do casually.
-
-`ps3db` is exposed but not mountable, because `CONFIG_UFS_FS` is off. That is
-deliberate rather than an oversight: Linux UFS support is read-only and patchy,
-GameOS uses its own variant, and there is nothing on that region worth reading
-from Linux. The block device is still there for imaging if you want a backup.
+`ps3db` is exposed but not mountable, because `CONFIG_UFS_FS` is off. Linux UFS
+support is read-only and patchy, GameOS uses its own variant, and there is
+nothing on that region worth reading from Linux. The block device is still
+there for imaging if you want a backup.
 
 ## Module parameters
 
@@ -581,9 +570,8 @@ ps3disk.regions=0xc                # OtherOS and the cache region
 ps3disk.otheros_rw=0               # everything read-only, for a rescue boot
 ```
 
-Each unexposed region saves a `request_queue` and its per-CPU contexts — tens
-of kilobytes, which on a 256 MB machine is worth having if you do not want
-them.
+Each unexposed region saves a `request_queue` and its per-CPU contexts, tens
+of kilobytes.
 
 ## Considered and rejected
 
@@ -598,9 +586,9 @@ fragile, and unnecessary.
 hack. It discards information the hypervisor supplies, and its naming does not
 match petitboot.
 
-**Hiding region 0 by default.** Tempting, since it is the one that can destroy
-everything. Rejected: read-only makes it harmless, and it is genuinely useful
-for a full-drive backup. `regions=` excludes it for anyone who disagrees.
+**Hiding region 0 by default.** Rejected: read-only makes it harmless, and it
+is useful for a full-drive backup. `regions=` excludes it if you would rather
+it were not there.
 
 **`GENHD_FL_NO_PART` on non-OtherOS regions.** Would suppress partition
 scanning on regions Linux has no table format for. Rejected as unnecessary —
@@ -608,14 +596,13 @@ the PS3's partition layout is not one Linux recognises, so the scan finds
 nothing, and the cache region is a bare FAT32 filesystem that must stay
 mountable.
 
-Worth noting on the same subject: the OtherOS region's ext4 superblock is also
-physically inside region 0, but Linux will not find it there, because it only
-probes the start of a device and a partition table it cannot parse. There is
-no duplicate-UUID confusion between `ps3da` and `ps3dd`.
+The OtherOS region's ext4 superblock is also physically inside region 0, but
+Linux will not find it there, because it only probes the start of a device and
+a partition table it cannot parse. There is no duplicate-UUID confusion between
+`ps3da` and `ps3dd`.
 
-**A custom udev rule as part of the patch.** Not needed, and worth separating
-from the rule this repository does ship, because they answer different
-questions.
+**A custom udev rule as part of the patch.** Not needed, and separate from the
+rule this repository does ship.
 
 The patch needs no udev support. Each region is an ordinary gendisk with its
 own uevent; `systemd-udevd` and `initramfs-tools` see them the way they see any
@@ -662,7 +649,7 @@ Nothing else in the patch depends on block-layer API that has moved.
 `bitmap_find_next_zero_area()` and the tag-set sharing behaviour are all
 unchanged as of v6.17.
 
-One thing to re-check rather than assume when moving up: patch 0001. Upstream
+Re-check patch 0001 when moving up. Upstream
 `drivers/block/ps3disk.c` at v6.17 still copies every bio vector to offset
 zero — the fix was posted in November 2025 and is not in v6.17. Verify whether
 the tree you move to contains `offset += bvec.bv_len` before dropping 0001.

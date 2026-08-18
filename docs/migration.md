@@ -47,14 +47,12 @@ update-initramfs -u -k all
 ```
 
 That is the native equivalent of the `mkinitramfs -o /boot/initrd.img` in
-README step 4, which is the chroot form used from the build host. Either
-produces the same thing; use whichever matches where you are.
+README step 4, which is the chroot form used from the build host.
 
 ## Use labels, not device names
 
-The substitutions above use `LABEL=` rather than `ps3dd1`. That is the point of
-doing this once rather than twice — labels survive any future change to region
-naming, and they are what `scripts/build-image.sh` and
+The substitutions above use `LABEL=` rather than `ps3dd1`. Labels survive any
+future change to region naming, and they are what `scripts/build-image.sh` and
 `scripts/partition-region.sh` already set:
 
 ```
@@ -72,7 +70,7 @@ is ext4 on a driver-provided device. If you would rather not rely on that, use
 
 ## Recovering if you already rebooted
 
-Nothing is lost. At the petitboot shell:
+At the petitboot shell:
 
 ```
 mount /dev/ps3dd1 /mnt
