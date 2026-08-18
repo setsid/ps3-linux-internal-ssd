@@ -220,10 +220,20 @@ directory under `/lib/modules` exactly, which is what turning
 `mkinitramfs` builds an initrd with no modules in it.
 
 Copy it verbatim, including any trailing `+` — that character is part of the
-directory name. On the console here `uname -r` reports
-`6.4.0-g98ec4e7cee0f+`, with the plus, and that is the directory name under
-`/lib/modules`. `ls /srv/ps3root/lib/modules` after `modules_install` is the
-check that settles it.
+directory name, and `6.4.0+` and `6.4.0` are different directories.
+
+Do not copy a release string out of this document. What you get depends on the
+tree: `kernel-config.sh` turns `CONFIG_LOCALVERSION_AUTO` off and sets no
+suffix of its own, so a fresh clone gives a bare `6.4.0+`, while a tree that has
+been built before under different settings may give something longer. The
+authority is the tree in front of you:
+
+```
+make -s -C ~/ps3-linux ARCH=powerpc CROSS_COMPILE=powerpc64-linux-gnu- kernelrelease
+ls /srv/ps3root/lib/modules      # after modules_install, must match
+```
+
+`make-debian-installer.sh` reads it the same way and never asks you to type it.
 
 The `.config` copy is not strictly required — `modules_install` does not place
 it, and without it `mkinitramfs` warns that it cannot check for `CONFIG_RD_ZSTD`
@@ -408,7 +418,11 @@ Numbers from that run, which are the ones to expect:
 | image | 875 MB used of a 4 GiB filesystem |
 | initrd | 13.9 MB |
 | gzipped image on the stick | 337 MB |
-| kernel release | `6.4.0-g98ec4e7cee0f+` |
+| kernel release | `6.4.0-g98ec4e7cee0f+` — that tree's value, not a target |
+
+The kernel release above is what that particular tree produced; it carried a
+`.scmversion` from an early build. A clean clone gives `6.4.0+`. Read yours
+with `make -s kernelrelease` rather than expecting either.
 
 The tree is 721 MB rather than the 1.4 GB quoted in earlier notes because
 `build-rootfs.sh` now runs `apt-get clean`. The earlier tree carried every

@@ -83,9 +83,16 @@ make -s kernelrelease
 ```
 
 That string is the directory name under `/lib/modules`, and it is the argument
-`mkinitramfs` needs in README step 4. A trailing `+` appears when HEAD is not on
-an exact tag, and it is part of the string — `6.4.0+` and `6.4.0` are different
-directories. Copy what `kernelrelease` prints, including any `+`.
+`mkinitramfs` needs in README step 4.
+
+It is not fixed across trees. A clean clone configured by this script gives
+`6.4.0+`; a tree built before under other settings can give something longer.
+Never copy a release string out of documentation — read it from the tree you
+are building.
+
+The trailing `+` appears when HEAD is not on an exact tag and is part of the
+string: `6.4.0+` and `6.4.0` are different directories. Copy what
+`kernelrelease` prints, including any `+`.
 
 Set `CONFIG_LOCALVERSION="-something"` yourself if you want a distinguishable
 suffix, but it is optional. Whatever you choose, re-read `kernelrelease`

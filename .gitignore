@@ -5,3 +5,5 @@
 *-out.txt
 vmlinux
 vmlinux-stripped
+.ps3-pkgcount
+.ps3-objcount

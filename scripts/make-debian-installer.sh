@@ -8,7 +8,8 @@
 #                    exactly as the individual scripts do. Automatic when stdout
 #                    is not a terminal, when TERM is dumb, or when NO_COLOR is
 #                    set.
-#   --kernel DIR     kernel tree            (default ~/ps3-linux)
+#   --kernel DIR     kernel tree            (default ~/ps3-linux, the
+#                    invoking user's home, not root's)
 #   --rootfs DIR     Debian tree            (default /srv/ps3root)
 #   --image FILE     image to build         (default /tmp/ps3root4g.img)
 #   --user NAME      user to create in the tree, if it is being built
@@ -28,7 +29,15 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPTS="$REPO/scripts"
 
-KDIR="$HOME/ps3-linux"
+# Under sudo $HOME is root's, so the default kernel tree would be /root/ps3-linux
+# - a path nobody has. Resolve the invoking user's home instead.
+CALLER_HOME="$HOME"
+if [ -n "${SUDO_USER:-}" ]; then
+    _h=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+    [ -n "$_h" ] && CALLER_HOME="$_h"
+fi
+
+KDIR="$CALLER_HOME/ps3-linux"
 ROOTFS=/srv/ps3root
 IMG=/tmp/ps3root4g.img
 BLOCKS=1048576
@@ -112,6 +121,9 @@ ui_begin() {
     printf '\033[2J\033[H'
     printf '\033[%d;%dr' $((HDR_LINES + 1)) "$TROWS"
     printf '\033[%d;1H' $((HDR_LINES + 1))
+    # Draw the block once before any output scrolls, otherwise the first screen
+    # shows the body over an empty header and only settles at the next phase.
+    ui_header
 }
 
 ui_end() {
@@ -213,6 +225,71 @@ watch_fd0() { # watch_fd0 <pid> <total-bytes> <label>
     fi
 }
 
+WATCH_PID=""
+start_watch() {
+    [ "$UI" = fancy ] || return 0   # nothing to draw into
+    "$@" & WATCH_PID=$!
+}
+stop_watch() {
+    [ -n "$WATCH_PID" ] || return 0
+    kill "$WATCH_PID" 2>/dev/null
+    wait "$WATCH_PID" 2>/dev/null
+    WATCH_PID=""
+}
+
+# Count object files against a target. The target is learned from the last
+# successful build and corrected upward if this one overshoots, so the bar
+# moves and is roughly right rather than precise and wrong.
+watch_objs() { # watch_objs <dir> <target>
+    local dir=$1 tot=$2 n
+    while :; do
+        n=$(find "$dir" -name '*.o' 2>/dev/null | wc -l)
+        [ "$n" -gt "$tot" ] && tot=$n
+        if [ "$UI" = fancy ]; then
+            PHASE_DETAIL="compiling  $(bar "$n" "$tot")  ${n}/${tot} objects"
+            ui_header
+        fi
+        sleep 5
+    done
+}
+
+# Run a command, mirroring output as usual, counting lines that match a shell
+# pattern to drive a bar. Used where the command announces its own units of
+# work: debootstrap unpacking packages, make installing modules.
+run_counted() { # run_counted <label> <total> <pattern> -- cmd...
+    local lbl=$1 tot=$2 pat=$3; shift 3
+    [ "${1:-}" = -- ] && shift
+    printf '%s$ %s%s\n' "$D" "$*" "$N"
+    printf '$ %s\n' "$*" >> "$LOG"
+    "$@" 2>&1 | { n=0; while IFS= read -r line; do
+        printf '%s\n' "$line"
+        printf '%s\n' "$line" >> "$LOG"
+        case "$line" in
+            $pat) n=$((n + 1))
+                  if [ "$UI" = fancy ] && [ "$tot" -gt 0 ]; then
+                      PHASE_DETAIL="$lbl  $(bar "$n" "$tot")  ${n}/${tot}"
+                      ui_header
+                  fi ;;
+        esac
+    done; }
+    local rc=${PIPESTATUS[0]}
+    [ "$rc" = 0 ] || fail "$1 exited $rc"
+}
+
+# As watch_du, but for a single file that grows - a sparse image being filled.
+watch_du_file() { # watch_du_file <file> <total-bytes> <label>
+    local f=$1 tot=$2 lbl=$3 cur
+    while :; do
+        cur=$(du -sB1 "$f" 2>/dev/null | cut -f1)
+        [ -n "$cur" ] || cur=0
+        if [ "$UI" = fancy ]; then
+            PHASE_DETAIL="$lbl  $(bar "$cur" "$tot")"
+            ui_header
+        fi
+        sleep 2
+    done
+}
+
 # Poll the size of a growing destination against a known source total.
 watch_du() { # watch_du <pid> <dest> <total-bytes> <label>
     local pid=$1 dest=$2 tot=$3 lbl=$4 cur
@@ -291,35 +368,41 @@ detect_state() {
 
 mark() {
     case "$1" in
-        done)    printf '%s[ done ]%s' "$G" "$N" ;;
-        stale)   printf '%s[stale ]%s' "$Y" "$N" ;;
-        missing) printf '%s[ todo ]%s' "$D" "$N" ;;
-        blocked) printf '%s[  --  ]%s' "$D" "$N" ;;
+        done)    printf '%s%-6s%s' "$G" "done"  "$N" ;;
+        stale)   printf '%s%-6s%s' "$Y" "stale" "$N" ;;
+        missing) printf '%s%-6s%s' "$D" "todo"  "$N" ;;
+        blocked) printf '%s%-6s%s' "$D" "-"     "$N" ;;
     esac
 }
 
+# One dim line when a step is passed over, so the run itself says why nothing
+# happened rather than leaving it to the checklist printed minutes earlier.
+skip() { printf '    %sskip    %s - already done%s\n' "$D" "$1" "$N"; }
+
 show_state() {
     echo
-    echo "${B}Where things stand${N}"
+    echo "    ${B}Where things stand${N}"
     echo
-    printf '  %skernel%s\n' "$D" "$N"
-    printf '    %s  1. tree at %s\n'     "$(mark $ST_KTREE)" "$KDIR"
-    printf '    %s  2. patches applied\n' "$(mark $ST_PATCH)"
-    printf '    %s  3. built\n'           "$(mark $ST_BUILD)"
-    printf '  %suserland%s\n' "$D" "$N"
-    printf '    %s  0. Debian tree at %s\n' "$(mark $ST_ROOTFS)" "$ROOTFS"
-    printf '  %sthen, in order%s\n' "$D" "$N"
-    printf '    %s  4. kernel, modules and initrd in the tree\n' "$(mark $ST_INSTALL)"
-    printf '    %s  5. image at %s\n'     "$(mark $ST_IMAGE)" "$IMG"
-    printf '    %s  6. stick prepared\n'  "$(mark missing)"
+    printf '    %skernel%s\n' "$D" "$N"
+    printf '      %s  1. tree at %s\n'      "$(mark $ST_KTREE)"  "$KDIR"
+    printf '      %s  2. patches applied\n'  "$(mark $ST_PATCH)"
+    printf '      %s  3. built\n'            "$(mark $ST_BUILD)"
     echo
-    [ -n "$KREL" ] && echo "  ${D}kernel release: $KREL${N}"
+    printf '    %suserland%s\n' "$D" "$N"
+    printf '      %s  0. Debian tree at %s\n' "$(mark $ST_ROOTFS)" "$ROOTFS"
+    echo
+    printf '    %sthen, in order%s\n' "$D" "$N"
+    printf '      %s  4. kernel, modules and initrd in the tree\n' "$(mark $ST_INSTALL)"
+    printf '      %s  5. image at %s\n'      "$(mark $ST_IMAGE)"  "$IMG"
+    printf '      %s  6. stick prepared\n'   "$(mark missing)"
+    echo
+    [ -n "$KREL" ] && echo "    ${D}kernel release: $KREL${N}"
     if [ "$ST_BUILD" = stale ] || [ "$ST_INSTALL" = stale ] \
        || [ "$ST_IMAGE" = stale ]; then
         echo
-        warn "Something marked stale is older than what it was built from."
-        warn "Rebuilding it is the point - a stale kernel in a fresh image is"
-        warn "the trap that costs a whole write-and-boot cycle to notice."
+        warn "    Something marked stale is older than what it was built from."
+        warn "    Rebuilding it is the point - a stale kernel in a fresh image"
+        warn "    is the trap that costs a whole write-and-boot cycle to notice."
     fi
     echo
 }
@@ -339,7 +422,9 @@ do_ktree() {
         "Cloning Geoff Levand's ps3-linux tree. This is the PS3 branch of" \
         "Linux 6.4 - mainline plus the platform support the console needs."
     pause_for "clone the kernel tree into $KDIR" "a few minutes, network bound"
-    run git clone --depth 1 \
+    # --progress: git suppresses its counter when stdout is not a terminal, and
+    # here it is a pipe into tee. Its own figures are honest; do not invent any.
+    run git clone --progress --depth 1 \
         https://git.kernel.org/pub/scm/linux/kernel/git/geoff/ps3-linux.git "$KDIR"
 }
 
@@ -359,8 +444,13 @@ do_build() {
         "15 minutes or more on $(nproc) cores"
     run make -C "$KDIR" ARCH=powerpc ps3_defconfig
     run "$SCRIPTS/kernel-config.sh" "$KDIR"
+    local target=1400
+    [ -f "$KDIR/.ps3-objcount" ] && target=$(cat "$KDIR/.ps3-objcount")
+    start_watch watch_objs "$KDIR" "$target"
     # Bare make: vmlinux alone would skip modules and step 4 would have none.
     run make -C "$KDIR" ARCH=powerpc CROSS_COMPILE="$CROSS" -j"$(nproc)"
+    stop_watch
+    find "$KDIR" -name '*.o' 2>/dev/null | wc -l > "$KDIR/.ps3-objcount"
     KREL=$(kernelrelease) || KREL=""
     say "kernel release: $KREL"
 }
@@ -371,13 +461,20 @@ do_rootfs() {
         "and running its package scripts under qemu emulation - hence slow."
     pause_for "build the Debian tree at $ROOTFS" \
         "about 20 minutes, host speed and emulation bound"
+    # debootstrap announces each package as it unpacks. The total is learned
+    # from the last successful run; 320 is a starting figure for this set.
+    local ptarget=320
+    [ -f "$REPO/.ps3-pkgcount" ] && ptarget=$(cat "$REPO/.ps3-pkgcount")
     if [ -n "$USERNAME" ]; then
-        run "$SCRIPTS/build-rootfs.sh" "$ROOTFS" "$USERNAME"
+        run_counted "unpacking" "$ptarget" 'I: *[UE][nx]*ing *' -- \
+            "$SCRIPTS/build-rootfs.sh" "$ROOTFS" "$USERNAME"
     else
         say "${Y}build-rootfs.sh will ask for a username and two passwords.${N}"
         say "${Y}Nothing is shipped or defaulted - you set them now.${N}"
-        run "$SCRIPTS/build-rootfs.sh" "$ROOTFS"
+        run_counted "unpacking" "$ptarget" 'I: *[UE][nx]*ing *' -- \
+            "$SCRIPTS/build-rootfs.sh" "$ROOTFS"
     fi
+    ls "$ROOTFS/var/lib/dpkg/info"/*.list 2>/dev/null | wc -l > "$REPO/.ps3-pkgcount"
 }
 
 do_install() {
@@ -388,8 +485,17 @@ do_install() {
     pause_for "install kernel $KREL into $ROOTFS" "a minute or two"
     run "${CROSS}strip" -s -o /tmp/vmlinux-stripped "$KDIR/vmlinux"
     run cp /tmp/vmlinux-stripped "$ROOTFS/boot/vmlinux"
-    run make -C "$KDIR" ARCH=powerpc CROSS_COMPILE="$CROSS" \
-        INSTALL_MOD_PATH="$ROOTFS" modules_install
+    local nko
+    nko=$(find "$KDIR" -name '*.ko' 2>/dev/null | wc -l)
+    if [ "$nko" -gt 0 ]; then
+        run_counted "installing modules" "$nko" '*INSTALL*.ko*' -- \
+            make -C "$KDIR" ARCH=powerpc CROSS_COMPILE="$CROSS" \
+            INSTALL_MOD_PATH="$ROOTFS" modules_install
+    else
+        # ps3_defconfig builds almost everything in, so there may be none.
+        run make -C "$KDIR" ARCH=powerpc CROSS_COMPILE="$CROSS" \
+            INSTALL_MOD_PATH="$ROOTFS" modules_install
+    fi
     run cp "$KDIR/.config" "$ROOTFS/boot/config-$KREL"
     run chroot "$ROOTFS" mkinitramfs -o /boot/initrd.img "$KREL"
     [ -f "$ROOTFS/boot/initrd.img" ] || fail "no initrd was produced"
@@ -404,7 +510,12 @@ do_image() {
     tot=$(du -sB1 "$ROOTFS" 2>/dev/null | cut -f1); [ -n "$tot" ] || tot=0
     pause_for "build $IMG from $ROOTFS ($(numfmt --to=iec "$tot" 2>/dev/null || echo "$tot bytes"))" \
         "a few minutes"
+    # build-image.sh mounts the image somewhere private, so watch the blocks
+    # actually allocated to the sparse image file instead. Same shape, and it
+    # is a real measurement rather than a guess.
+    start_watch watch_du_file "$IMG" "$tot" "copying tree"
     run "$SCRIPTS/build-image.sh" "$ROOTFS" "$IMG" "$BLOCKS"
+    stop_watch
     say "computing md5 of the image"
     IMG_MD5=$(md5_of "$IMG" "hashing image")
     say "md5: $IMG_MD5"
@@ -427,6 +538,34 @@ md5_of() { # md5_of <file> <label> -> hash on stdout
 IS_WSL=0
 grep -qi microsoft /proc/version 2>/dev/null && IS_WSL=1
 
+# sudo strips WSL's Windows interop entries from PATH, so `command -v
+# powershell.exe` finds nothing - and this tool requires sudo, so that is every
+# run. Fall back to an absolute path, with the Windows drive root taken from
+# /proc/mounts rather than assuming /mnt/c, since WSL can mount elsewhere.
+windows_root() {
+    local dev mnt fs rest
+    while read -r dev mnt fs rest; do
+        case "$fs" in 9p|drvfs|drvfs2|v9fs) ;; *) continue ;; esac
+        case "$dev" in [A-Za-z]:*) ;; *) continue ;; esac
+        case "$dev" in [Cc]:*) printf '%s\n' "$mnt"; return 0 ;; esac
+    done < /proc/mounts
+    [ -d /mnt/c ] && printf '/mnt/c\n' && return 0
+    return 1
+}
+
+find_powershell() {
+    local p root
+    for p in powershell.exe pwsh.exe; do
+        p=$(command -v "$p" 2>/dev/null) && [ -n "$p" ] && { printf '%s\n' "$p"; return 0; }
+    done
+    root=$(windows_root) || return 1
+    for p in "$root/Windows/System32/WindowsPowerShell/v1.0/powershell.exe" \
+             "$root/Program Files/PowerShell/7/pwsh.exe"; do
+        [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+    done
+    return 1
+}
+
 STICK_MNT=""
 STICK_DESC=""
 STICK_CLEANUP=""
@@ -446,9 +585,8 @@ declare -a CAND_ID CAND_LABEL CAND_SIZE CAND_FS CAND_FREE
 scan_removable() {
     CAND_ID=(); CAND_LABEL=(); CAND_SIZE=(); CAND_FS=(); CAND_FREE=()
     if [ "$IS_WSL" = 1 ]; then
-        local ps out line
-        ps=$(command -v powershell.exe || command -v pwsh.exe || true)
-        [ -n "$ps" ] || return 1
+        local ps out
+        ps=$(find_powershell) || return 1
         # DriveType 2 is removable. Anything else is never listed.
         out=$("$ps" -NoProfile -Command \
 "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=2' | ForEach-Object { \
@@ -485,9 +623,10 @@ choose_stick() {
         if ! scan_removable; then
             if [ "$IS_WSL" = 1 ]; then
                 warn "No removable drives found."
-                warn "On WSL this needs powershell.exe reachable to tell a USB"
-                warn "stick from your system disk. Without it there is no safe"
-                warn "way to enumerate, so nothing is offered."
+                warn "On WSL this needs powershell.exe to tell a USB stick from"
+                warn "your system disk. Without it there is no safe way to"
+                warn "enumerate, so nothing is offered."
+                warn "Looked for it on PATH and under $(windows_root 2>/dev/null || echo '/mnt/c')."
             else
                 warn "No removable drives found."
             fi
@@ -611,28 +750,28 @@ EOF
 [ "$(id -u)" = 0 ] || { echo "run with sudo - it writes to $ROOTFS" >&2; exit 1; }
 
 ui_begin
-say "log: $LOG"
+[ "$UI" = plain ] && say "log: $LOG"
 detect_state
 show_state
 
-echo "${B}What would you like to do?${N}"
+echo "    ${B}What would you like to do?${N}"
 echo
-echo "  1) Everything outstanding      - run every step not marked done"
-echo "  2) Rebuild loop only           - image and stick, from the tree as it is"
-echo "  3) A single step"
-echo "  q) Quit"
+echo "      1) Everything outstanding   - run every step not marked done"
+echo "      2) Rebuild loop only        - image and stick, from the tree as it is"
+echo "      3) A single step"
+echo "      q) Quit"
 echo
-ask CHOICE "  Choice: "
+ask CHOICE "      Choice: "
 [ -n "$CHOICE" ] || CHOICE=q
 
 case "$CHOICE" in
     1)
-        [ "$ST_KTREE" = done ]  || do_ktree
-        [ "$ST_PATCH" = done ]  || do_patch
-        [ "$ST_BUILD" = done ]  || do_build
-        [ "$ST_ROOTFS" = done ] || do_rootfs
-        [ "$ST_INSTALL" = done ] || do_install
-        [ "$ST_IMAGE" = done ]  || do_image
+        [ "$ST_KTREE" = done ]   && skip "1 kernel tree"    || do_ktree
+        [ "$ST_PATCH" = done ]   && skip "2 patches"        || do_patch
+        [ "$ST_BUILD" = done ]   && skip "3 kernel build"   || do_build
+        [ "$ST_ROOTFS" = done ]  && skip "0 Debian tree"    || do_rootfs
+        [ "$ST_INSTALL" = done ] && skip "4 kernel in tree" || do_install
+        [ "$ST_IMAGE" = done ]   && skip "5 image"          || do_image
         do_stick
         ;;
     2)
@@ -643,9 +782,10 @@ case "$CHOICE" in
         ;;
     3)
         echo
-        echo "  1 kernel tree   2 patches   3 kernel build   0 Debian tree"
-        echo "  4 kernel into tree   5 image   6 stick"
-        ask S "  Step: "
+        echo "      1 kernel tree        2 patches   3 kernel build"
+        echo "      0 Debian tree        4 kernel into tree"
+        echo "      5 image              6 stick"
+        ask S "      Step: "
         [ -n "$S" ] || S=q
         case "$S" in
             1) do_ktree ;; 2) do_patch ;; 3) do_build ;; 0) do_rootfs ;;
