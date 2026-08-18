@@ -76,8 +76,16 @@ if [ ! -e /proc/sys/fs/binfmt_misc/qemu-ppc64 ] && [ -z "$QEMU" ]; then
     exit 1
 fi
 
+# Ask again rather than exiting. An empty answer used to end the run outright,
+# and it takes very little to produce one: a stray newline already sitting in
+# the terminal buffer is enough, and by this point the caller may be twenty
+# minutes from being able to try again.
 if [ -z "$USERNAME" ]; then
-    read -r -p "username to create: " USERNAME
+    for _try in 1 2 3; do
+        read -r -p "username to create: " USERNAME || USERNAME=""
+        [ -n "$USERNAME" ] && break
+        echo "a username is required" >&2
+    done
 fi
 [ -n "$USERNAME" ] || { echo "no username given" >&2; exit 1; }
 

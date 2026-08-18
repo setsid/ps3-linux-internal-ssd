@@ -93,29 +93,51 @@ else
     exec 3>/dev/null
 fi
 
-TROWS=24; TCOLS=80
+TROWS=24; TCOLS=80; CLOCK_COL=64
 term_size() {
     local sz
-    sz=$(stty size 2>/dev/null) || sz=""
+    # From the terminal rather than stdin. The painter below runs in the
+    # background, where stdin is /dev/null and stty reports nothing, and it is
+    # the process that most needs the real width.
+    sz=$(stty size < /dev/tty 2>/dev/null) || sz=""
     if [ -n "$sz" ]; then
         TROWS=${sz%% *}; TCOLS=${sz##* }
     fi
     [ "${TROWS:-0}" -ge 12 ] 2>/dev/null || TROWS=24
     [ "${TCOLS:-0}" -ge 40 ] 2>/dev/null || TCOLS=80
+    CLOCK_COL=$(( TCOLS - 16 )); [ "$CLOCK_COL" -lt 24 ] && CLOCK_COL=24
+    return 0
 }
 
-HDR_LINES=8
-PHASE_NUM=0
+# Header state lives in files, not shell variables, because the processes that
+# produce it are not the process that draws it: every watcher is a background
+# job with its own copy of the shell's memory, so a bar set in one was invisible
+# to the next and the two drew over each other in the same fixed row. One
+# painter process owns the terminal and renders whatever state it finds. That
+# also gets the elapsed clock ticking, since the painter redraws whether or not
+# anything else has produced output.
+UIDIR=""
+BAR_SLOT=""
+HDR_BASE=7                  # title, rule, phase, why, why2, log, rule
+HDR_LINES=8                 # base, plus one bar line always reserved
+LAST_ROWS=""
 PHASE_TOTAL=7
-PHASE_NAME="starting"
-PHASE_WHY=""
-PHASE_WHY2=""
-PHASE_DETAIL=""
-PHASE_LABEL=""
-PHASE_CUR=0
-PHASE_TOT=0
-PHASE_EXTRA=""
 START_TS=$(date +%s)
+
+ui_state() { # ui_state <name> <value...>
+    [ -n "$UIDIR" ] || return 0
+    local f=$1; shift
+    printf '%s\n' "$*" > "$UIDIR/$f" 2>/dev/null || true
+}
+ui_get() { cat "$UIDIR/$1" 2>/dev/null || true; }
+
+# A bar is a file. Anything that wants one takes a slot and writes to it; the
+# painter draws a line per slot it finds, so bars no longer share a row.
+bar_alloc() {
+    [ -n "$UIDIR" ] || return 0
+    mktemp "$UIDIR/bar.XXXXXX" 2>/dev/null || true
+}
+bar_free() { [ -n "${1:-}" ] && rm -f "$1" 2>/dev/null; return 0; }
 
 hms() {
     local t=$1
@@ -125,30 +147,38 @@ hms() {
 # The one thing a user watches during a fifteen minute step, so it lives in the
 # fixed header rather than scrolling away, and carries the number as well as the
 # bar - at a glance a bar alone does not separate 70% from 80%.
-progress_line() {
-    local w=40 pct filled
-    [ -n "$PHASE_LABEL" ] || return 0
-    case "${PHASE_CUR}${PHASE_TOT}" in *[!0-9]*) PHASE_TOT=0 ;; esac
-    if [ "${PHASE_TOT:-0}" -gt 0 ]; then
-        pct=$(( PHASE_CUR * 100 / PHASE_TOT ))
-        [ "$pct" -gt 100 ] && pct=100
+bar_line() { # bar_line <slot-file>
+    local lbl cur tot extra w pct filled
+    IFS=$'\t' read -r lbl cur tot extra < "$1" 2>/dev/null || return 0
+    [ -n "${lbl:-}" ] || return 0
+    case "${cur:-x}${tot:-x}" in *[!0-9]*) cur=0; tot=0 ;; esac
+    # Size the bar to the window instead of a fixed 40 columns, or a narrow
+    # terminal wraps the header into the scrolling region below it and the two
+    # start overwriting each other. Below 64 columns the trailing detail goes
+    # first, since the bar and the percentage are what is being watched.
+    w=$(( TCOLS - 46 )); [ "$w" -gt 40 ] && w=40; [ "$w" -lt 8 ] && w=8
+    [ "$TCOLS" -lt 64 ] && extra=""
+    if [ "${tot:-0}" -gt 0 ]; then
+        pct=$(( cur * 100 / tot )); [ "$pct" -gt 100 ] && pct=100
         filled=$(( pct * w / 100 ))
-        printf '  %s%-16s%s %s%s%s%s%s  %s%3d%%%s  %s%s%s' \
-            "$B" "$PHASE_LABEL" "$N" \
+        printf '  %s%-16s%s %s%s%s%s%s %s%3d%%%s %s%s%s' \
+            "$B" "${lbl:0:16}" "$N" \
             "$C" "$(printf '%*s' "$filled" '' | tr ' ' '#')" "$N" \
             "$D" "$(printf '%*s' $((w - filled)) '' | tr ' ' '.')" \
             "$B" "$pct" "$N" \
-            "$D" "$PHASE_EXTRA" "$N"
+            "$D" "${extra:0:18}" "$N"
     else
-        printf '  %s%-16s%s  %s%s%s' "$B" "$PHASE_LABEL" "$N" \
-            "$D" "$PHASE_EXTRA" "$N"
+        printf '  %s%-16s%s %s%s%s' "$B" "${lbl:0:16}" "$N" \
+            "$D" "${extra:0:18}" "$N"
     fi
 }
 
 set_progress() { # set_progress <label> <cur> <tot> [extra]
-    PHASE_LABEL=$1; PHASE_CUR=$2; PHASE_TOT=$3; PHASE_EXTRA=${4:-}
+    [ -n "$BAR_SLOT" ] || return 0
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "${4:-}" > "$BAR_SLOT" 2>/dev/null || true
 }
 
+PAINT_PID=""
 ui_begin() {
     [ "$UI" = fancy ] || return 0
     term_size
@@ -157,37 +187,107 @@ ui_begin() {
     printf '\033[%d;1H' $((HDR_LINES + 1)) >&3
     # Draw the block once before any output scrolls, otherwise the first screen
     # shows the body over an empty header and only settles at the next phase.
-    ui_header
+    ui_render
+    # From here one painter owns the header, twice a second. It is the only
+    # writer that saves and restores the cursor, so there is no race over the
+    # terminal's single save slot, and it re-reads the window size every pass,
+    # which is what makes a mid-run resize settle by itself.
+    ( while :; do ui_render; sleep 0.5; done ) & PAINT_PID=$!
 }
 
 ui_end() {
     [ "$UI" = fancy ] || return 0
+    if [ -n "$PAINT_PID" ]; then
+        kill "$PAINT_PID" 2>/dev/null
+        wait "$PAINT_PID" 2>/dev/null
+        PAINT_PID=""
+    fi
     printf '\033[r' >&3
     printf '\033[%d;1H\033[?25h' "$TROWS" >&3
 }
-trap 'ui_end; hand_over_all' EXIT
+trap 'stop_all_watches; ui_end; ui_cleanup; hand_over_all' EXIT
 
 # Redraw the fixed block at the top. Leaves the cursor where it found it, so
-# the scrolling output below is undisturbed.
-ui_header() {
+# the scrolling output below is undisturbed. Height follows the number of live
+# bars, with one line always reserved so the ordinary single-bar case never
+# moves the scroll region.
+ui_render() {
     [ "$UI" = fancy ] || return 0
-    local el; el=$(hms $(( $(date +%s) - START_TS )))
-    local rule; rule=$(printf '%*s' $((TCOLS > 2 ? TCOLS - 1 : 79)) '' | tr ' ' '-')
+    local el rule f nb want
+    term_size
+    el=$(hms $(( $(date +%s) - START_TS )))
+    rule=$(printf '%*s' $((TCOLS > 2 ? TCOLS - 1 : 79)) '' | tr ' ' '-')
+
+    local slots=()
+    if [ -n "$UIDIR" ]; then
+        for f in "$UIDIR"/bar.*; do [ -f "$f" ] && slots+=("$f"); done
+    fi
+    nb=${#slots[@]}; [ "$nb" -lt 1 ] && nb=1
+    want=$(( HDR_BASE + nb ))
+    if [ "$want" != "$HDR_LINES" ] || [ "$TROWS" != "$LAST_ROWS" ]; then
+        local old=$HDR_LINES r grow=0
+        HDR_LINES=$want; LAST_ROWS=$TROWS
+        # Setting the scroll region homes the cursor, so all of this is bracketed
+        # by save and restore. Without that the body resumes writing from line 1,
+        # underneath the header, and is painted over half a second later - the
+        # output simply disappears.
+        printf '\033[s' >&3
+        if [ "$want" -gt "$old" ]; then
+            # Make room before taking it: insert the difference at the top of the
+            # body region so what is on screen moves down, and follow the body's
+            # cursor down by the same amount once the region is set.
+            grow=$((want - old))
+            printf '\033[%d;%dr' $((old + 1)) "$TROWS" >&3
+            printf '\033[%d;1H\033[%dL' $((old + 1)) "$grow" >&3
+        elif [ "$want" -lt "$old" ]; then
+            # Giving rows back: wipe them, or the last bar drawn stays on screen
+            # below the now shorter header.
+            for (( r = want + 1; r <= old; r++ )); do
+                printf '\033[%d;1H\033[K' "$r" >&3
+            done
+        fi
+        printf '\033[%d;%dr' $((HDR_LINES + 1)) "$TROWS" >&3
+        printf '\033[u' >&3
+        [ "$grow" -gt 0 ] && printf '\033[%dB' "$grow" >&3
+    fi
+
     printf '\033[s\033[H' >&3
     printf '%s\033[K\n' "${C}${B}Debian on PS3 - installer${N}" >&3
     printf '%s\033[K\n' "${D}${rule}${N}" >&3
-    printf '%s\033[K\n' "${B}Phase ${PHASE_NUM}/${PHASE_TOTAL}: ${PHASE_NAME}${N}   ${D}elapsed ${el}${N}" >&3
-    printf '%s\033[K\n' "${PHASE_WHY:0:$((TCOLS - 1))}" >&3
-    printf '%s\033[K\n' "${PHASE_WHY2:-}" >&3
-    printf '%s\033[K\n' "$(progress_line)" >&3
-    printf '%s\033[K\n' "${D}log: ${LOG}${N}" >&3
+    # The phase line is written first and the clock dropped onto it at a fixed
+    # column. Truncate the name to stop it running into the clock; truncate the
+    # why lines to the width, or they wrap into the scrolling region and the
+    # header and the output below start overwriting each other.
+    local nm; nm="Phase $(ui_get phasenum)/${PHASE_TOTAL}: $(ui_get name)"
+    printf '%s\033[K' "${B}${nm:0:$((CLOCK_COL - 2))}${N}" >&3
+    printf '\033[3;%dH%selapsed %s%s' "$CLOCK_COL" "$D" "$el" "$N" >&3
+    printf '\033[4;1H' >&3
+    local w1 w2; w1=$(ui_get why); w2=$(ui_get why2)
+    printf '%s\033[K\n' "${w1:0:$((TCOLS - 1))}" >&3
+    printf '%s\033[K\n' "${w2:0:$((TCOLS - 1))}" >&3
+    if [ "${#slots[@]}" -gt 0 ]; then
+        for f in "${slots[@]}"; do printf '%s\033[K\n' "$(bar_line "$f")" >&3; done
+    else
+        printf '\033[K\n' >&3
+    fi
+    local lg; lg="log: ${LOG}"
+    printf '%s\033[K\n' "${D}${lg:0:$((TCOLS - 1))}${N}" >&3
     printf '%s\033[K\n' "${D}${rule}${N}" >&3
     printf '\033[u' >&3
 }
 
+# The watchers still call this after set_progress. The painter is what draws
+# now, so it only has to not be an error.
+ui_header() { :; }
+
 phase() { # phase <n> <name> <why line 1> [why line 2]
-    PHASE_NUM=$1; PHASE_NAME=$2; PHASE_WHY=${3:-}; PHASE_WHY2=${4:-}
-    PHASE_DETAIL=""; PHASE_LABEL=""; PHASE_CUR=0; PHASE_TOT=0; PHASE_EXTRA=""
+    ui_state phasenum "$1"; ui_state name "$2"
+    ui_state why "${3:-}"; ui_state why2 "${4:-}"
+    # A new phase owns the header. Any watcher still running belongs to the step
+    # that just finished, so stop it before dropping the bars - killing the
+    # writer first, or it simply recreates its slot file on the next tick.
+    stop_all_watches
+    [ -n "$UIDIR" ] && rm -f "$UIDIR"/bar.* 2>/dev/null
     if [ "$UI" = plain ]; then
         echo
         echo "=============================================================="
@@ -294,6 +394,27 @@ runu() {
     [ "$rc" = 0 ] || fail "$1 exited $rc"
 }
 
+# For a step that asks the user questions. Two differences from run(). Stdin is
+# bound to the terminal explicitly rather than inherited, so it does not matter
+# what the tool itself was started with. And the output goes through tee rather
+# than the line counter in run_counted: tee passes a partial line straight
+# through, whereas a "while read line" loop holds it until a newline arrives, so
+# a prompt written without one appears only after the answer was due. That is
+# how "username to create: " and the error that followed it ended up on the same
+# line. build-rootfs.sh is the only step that needs this - it asks for a
+# username, then runs passwd twice and adduser.
+runi() {
+    printf '%s$ %s%s\n' "$D" "$*" "$N"
+    printf '$ %s\n' "$*" >> "$LOG"
+    if [ -r /dev/tty ]; then
+        "$@" < /dev/tty 2>&1 | tee -a "$LOG"
+    else
+        "$@" 2>&1 | tee -a "$LOG"
+    fi
+    local rc=${PIPESTATUS[0]}
+    [ "$rc" = 0 ] || fail "$1 exited $rc"
+}
+
 # Prefer the controlling terminal so prompts still work when output is piped,
 # but fall back to stdin when there is no tty.
 ask() { # ask <varname> [prompt]
@@ -317,7 +438,10 @@ confirm() { # confirm <prompt>
 # Poll a running process's read position on stdin. Honest progress: it is the
 # actual file offset, not an estimate. Linux only, which covers WSL too.
 watch_fd0() { # watch_fd0 <pid> <total-bytes> <label>
-    local pid=$1 tot=$2 lbl=$3 pos
+    local pid=$1 tot=$2 lbl=$3 pos own=""
+    # Unlike the others this runs in the foreground, so it has no slot handed to
+    # it by start_watch and takes one for itself.
+    if [ -z "$BAR_SLOT" ]; then BAR_SLOT=$(bar_alloc); own=$BAR_SLOT; fi
     while kill -0 "$pid" 2>/dev/null; do
         pos=$(awk '/^pos:/{print $2; exit}' "/proc/$pid/fdinfo/0" 2>/dev/null)
         [ -n "$pos" ] || pos=0
@@ -327,19 +451,54 @@ watch_fd0() { # watch_fd0 <pid> <total-bytes> <label>
         sleep 0.5
     done
     set_progress "$lbl" "$tot" "$tot" "done"
-    ui_header
+    [ -n "$own" ] && { bar_free "$own"; BAR_SLOT=""; }
+    return 0
 }
 
-WATCH_PID=""
+# More than one watcher can be live, and each gets its own bar line. The single
+# WATCH_PID this replaces lost the first pid whenever a second watcher started,
+# which left it running and drawing over whatever came next.
+WATCH_PIDS=()
+WATCH_SLOTS=()
 start_watch() {
     [ "$UI" = fancy ] || return 0   # nothing to draw into
-    "$@" & WATCH_PID=$!
+    local slot; slot=$(bar_alloc)
+    ( BAR_SLOT="$slot"; "$@" ) &
+    WATCH_PIDS+=("$!"); WATCH_SLOTS+=("$slot")
 }
+# Stops the most recent watcher and takes its line back, so the header shrinks.
 stop_watch() {
-    [ -n "$WATCH_PID" ] || return 0
-    kill "$WATCH_PID" 2>/dev/null
-    wait "$WATCH_PID" 2>/dev/null
-    WATCH_PID=""
+    local n=${#WATCH_PIDS[@]} i
+    [ "$n" -gt 0 ] || return 0
+    i=$((n - 1))
+    kill "${WATCH_PIDS[$i]}" 2>/dev/null
+    wait "${WATCH_PIDS[$i]}" 2>/dev/null
+    bar_free "${WATCH_SLOTS[$i]}"
+    unset "WATCH_PIDS[$i]" "WATCH_SLOTS[$i]"
+    return 0
+}
+ui_cleanup() { [ -n "${UIDIR:-}" ] && rm -rf "$UIDIR"; return 0; }
+
+stop_all_watches() {
+    local pid
+    for pid in ${WATCH_PIDS[@]+"${WATCH_PIDS[@]}"}; do
+        kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    done
+    WATCH_PIDS=(); WATCH_SLOTS=()
+    return 0
+}
+
+# Count matches in the log rather than in the pipeline. An interactive step
+# cannot have its output read line by line - see runi() - so its bar is driven
+# by watching what tee has already written to the log.
+watch_log_count() { # watch_log_count <file> <ere> <total> <label>
+    local f=$1 pat=$2 tot=$3 lbl=$4 n
+    while :; do
+        n=$(grep -Ec "$pat" "$f" 2>/dev/null) || n=0
+        [ "$n" -gt "$tot" ] && tot=$n
+        set_progress "$lbl" "$n" "$tot" "${n}/${tot}"
+        sleep 1
+    done
 }
 
 # Count object files against a target. The target is learned from the last
@@ -362,6 +521,7 @@ watch_objs() { # watch_objs <dir> <target>
 run_counted() { # run_counted <label> <total> <pattern> -- cmd...
     local lbl=$1 tot=$2 pat=$3; shift 3
     [ "${1:-}" = -- ] && shift
+    BAR_SLOT=$(bar_alloc)
     printf '%s$ %s%s\n' "$D" "$*" "$N"
     printf '$ %s\n' "$*" >> "$LOG"
     "$@" 2>&1 | { n=0; while IFS= read -r line; do
@@ -374,6 +534,7 @@ run_counted() { # run_counted <label> <total> <pattern> -- cmd...
         esac
     done; }
     local rc=${PIPESTATUS[0]}
+    bar_free "$BAR_SLOT"; BAR_SLOT=""
     [ "$rc" = 0 ] || fail "$1 exited $rc"
 }
 
@@ -597,15 +758,19 @@ do_rootfs() {
     # from the last successful run; 320 is a starting figure for this set.
     local ptarget=320
     [ -f "$REPO/.ps3-pkgcount" ] && ptarget=$(cat "$REPO/.ps3-pkgcount")
+    # This step is interactive whichever branch it takes: even with the username
+    # supplied it still runs passwd twice and adduser. So it goes through runi(),
+    # and the bar is counted off the log instead of out of the pipeline.
+    start_watch watch_log_count "$LOG" '^I: (Unpacking|Extracting)' \
+        "$ptarget" "unpacking"
     if [ -n "$USERNAME" ]; then
-        run_counted "unpacking" "$ptarget" 'I: *[UE][nx]*ing *' -- \
-            "$SCRIPTS/build-rootfs.sh" "$ROOTFS" "$USERNAME"
+        runi "$SCRIPTS/build-rootfs.sh" "$ROOTFS" "$USERNAME"
     else
         say "${Y}build-rootfs.sh will ask for a username and two passwords.${N}"
         say "${Y}Nothing is shipped or defaulted - you set them now.${N}"
-        run_counted "unpacking" "$ptarget" 'I: *[UE][nx]*ing *' -- \
-            "$SCRIPTS/build-rootfs.sh" "$ROOTFS"
+        runi "$SCRIPTS/build-rootfs.sh" "$ROOTFS"
     fi
+    stop_watch
     ls "$ROOTFS/var/lib/dpkg/info"/*.list 2>/dev/null | wc -l \
         | put_count "$REPO/.ps3-pkgcount"
 }
@@ -759,7 +924,7 @@ cleanup_stick() {
     rmdir "$STICK_MNT" 2>/dev/null || true
     STICK_CLEANUP=""
 }
-trap 'cleanup_stick; ui_end; hand_over_all' EXIT
+trap 'stop_all_watches; cleanup_stick; ui_end; ui_cleanup; hand_over_all' EXIT
 
 # Fills CAND_* arrays. Removable devices only - anything not removable is not
 # offered at all, because the failure mode is writing over the wrong disk.
@@ -980,6 +1145,10 @@ if [ -n "$RUN_AS_USER" ]; then
 fi
 [ "$(id -u)" = 0 ] || { echo "run with sudo - it writes to $ROOTFS" >&2; exit 1; }
 
+UIDIR=$(mktemp -d) || fail "cannot create a working directory"
+ui_state phasenum "0"; ui_state name "starting"
+ui_state why ""; ui_state why2 ""
+
 selftest_hash
 ui_begin
 check_ownership
@@ -1031,7 +1200,10 @@ esac
 
 # ------------------------------------------------------------------- the end
 
-PHASE_NAME="finished"; PHASE_LABEL=""; PHASE_EXTRA=""; ui_header
+ui_state name "finished"
+stop_all_watches
+[ -n "$UIDIR" ] && rm -f "$UIDIR"/bar.* 2>/dev/null
+ui_render
 ui_end
 
 echo
