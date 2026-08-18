@@ -33,10 +33,17 @@ rather than as a timing problem, which sends you looking at `rootdelay`.
 
 ### USB input built in
 
-`CONFIG_USB_EHCI_HCD`, `CONFIG_USB_OHCI_HCD`, `CONFIG_HID`, `CONFIG_USB_HID`
+`CONFIG_USB`, `CONFIG_USB_EHCI_HCD`, `CONFIG_USB_OHCI_HCD`, `CONFIG_HID`,
+`CONFIG_USB_HID`
 
 As modules these may not make it into the initramfs, leaving an emergency shell
 you cannot type at.
+
+`CONFIG_USB` is set for its dependents rather than for itself. `ps3_defconfig`
+has it as `m`, and Kconfig will not hold a symbol at `y` while something it
+depends on is `m`, so `olddefconfig` demoted the two host controllers and
+`USB_HID` back to modules on every run - after the script had set them. Setting
+`USB` is what makes the other three stay built in.
 
 ### cgroups
 
@@ -47,6 +54,12 @@ freezes if it cannot. Not optional, and off in `ps3_defconfig`.
 
 Controllers beyond `CGROUPS` itself are not all strictly required for PID 1 to
 survive, but leaving them out produces service failures later.
+
+`CGROUP_PERF` is not set. It needs `CONFIG_PERF_EVENTS`, which `ps3_defconfig`
+does not have, so the script used to ask for a symbol that could not exist and
+the request did nothing. systemd does not use that controller, and enabling perf
+on a 256 MB machine to satisfy it is not a trade worth making, so the request is
+gone rather than granted.
 
 ### namespaces
 
@@ -59,6 +72,13 @@ Required for `systemd-udevd`, `PrivateTmp=`, and most service sandboxing.
 `CONFIG_FHANDLE` for `open_by_handle_at`, `CONFIG_SECCOMP` and
 `CONFIG_SECCOMP_FILTER` for service hardening, `CONFIG_FANOTIFY`,
 `CONFIG_TMPFS_POSIX_ACL` and `CONFIG_TMPFS_XATTR`.
+
+## Checking what was actually set
+
+`kernel-config.sh` prints the resulting value of every symbol it asked for, and
+exits non-zero if any of them is not `y`. A subset check is how three USB
+symbols stayed modules across every build without being mentioned: the ones that
+were verified were the ones that happened to work.
 
 ## Version string
 
