@@ -165,7 +165,7 @@ ui_end() {
     printf '\033[r' >&3
     printf '\033[%d;1H\033[?25h' "$TROWS" >&3
 }
-trap 'ui_end' EXIT
+trap 'ui_end; hand_over_all' EXIT
 
 # Redraw the fixed block at the top. Leaves the cursor where it found it, so
 # the scrolling output below is undisturbed.
@@ -229,6 +229,50 @@ as_user() {
     else
         "$@"
     fi
+}
+
+# Ownership is handed over at the end of the run, not up front, and this is
+# load-bearing rather than tidiness.
+#
+# /tmp is sticky and world-writable, and with fs.protected_regular set - 2 on
+# most current kernels - the kernel refuses an O_CREAT open of a file owned by
+# neither the opener nor the directory. Root is not exempt: may_create_in_sticky()
+# in fs/namei.c has no CAP_DAC_OVERRIDE escape, and bash's >> passes O_CREAT.
+# So chowning the log to the invoking user while the run is still going makes it
+# unwritable by the root half of this script, which is most of it, and the whole
+# 90 minute build records nothing. That is the one output worth keeping when
+# something goes wrong, so root keeps ownership until there is nothing left to
+# write.
+#
+# From the EXIT trap, so it happens on failure and on interrupt too.
+hand_over() { # hand_over <path>...
+    [ -n "${RUN_AS_USER:-}" ] || return 0
+    local p grp
+    grp=$(id -gn "$RUN_AS_USER" 2>/dev/null) || grp="$RUN_AS_USER"
+    for p in "$@"; do
+        [ -e "$p" ] || continue
+        chown "$RUN_AS_USER:$grp" "$p" 2>/dev/null || true
+    done
+}
+
+hand_over_all() { hand_over "${LOG:-}" "${IMG:-}"; }
+
+# The other half. A file handed over by a previous run is owned by the user, so
+# root cannot reopen it here either - take it back before rewriting it.
+reclaim() { # reclaim <path>...
+    local p
+    for p in "$@"; do
+        [ -e "$p" ] || continue
+        chown 0:0 "$p" 2>/dev/null || true
+    done
+}
+
+# Write one of the learned-count files as the invoking user. Unlink first: an
+# earlier root-owned run may have left one the user cannot overwrite. They only
+# size a progress bar, so a stale count is not worth failing the run over.
+put_count() { # put_count <file>   (value on stdin)
+    rm -f "$1" 2>/dev/null || true
+    as_user tee "$1" >/dev/null 2>&1 || true
 }
 
 # Echo the command, run it, mirror its output to screen and log unfiltered.
@@ -533,8 +577,7 @@ do_build() {
     # Bare make: vmlinux alone would skip modules and step 4 would have none.
     runu make -C "$KDIR" ARCH=powerpc CROSS_COMPILE="$CROSS" -j"$(nproc)"
     stop_watch
-    find "$KDIR" -name '*.o' 2>/dev/null | wc -l \
-        | as_user tee "$KDIR/.ps3-objcount" >/dev/null
+    find "$KDIR" -name '*.o' 2>/dev/null | wc -l | put_count "$KDIR/.ps3-objcount"
     KREL=$(kernelrelease) || KREL=""
     say "kernel release: $KREL"
 }
@@ -564,7 +607,7 @@ do_rootfs() {
             "$SCRIPTS/build-rootfs.sh" "$ROOTFS"
     fi
     ls "$ROOTFS/var/lib/dpkg/info"/*.list 2>/dev/null | wc -l \
-        | as_user tee "$REPO/.ps3-pkgcount" >/dev/null
+        | put_count "$REPO/.ps3-pkgcount"
 }
 
 do_install() {
@@ -575,6 +618,9 @@ do_install() {
     pause_for "install kernel $KREL into $ROOTFS" "a minute or two"
     # strip reads the user's tree and writes /tmp; the copy lands in the rootfs
     # tree, which is root's. See the note on $ROOTFS ownership in do_rootfs().
+    # Unlink first: an older version of this tool ran the strip as root, and the
+    # user cannot overwrite what it left behind.
+    rm -f /tmp/vmlinux-stripped
     runu "${CROSS}strip" -s -o /tmp/vmlinux-stripped "$KDIR/vmlinux"
     run cp /tmp/vmlinux-stripped "$ROOTFS/boot/vmlinux"
     local nko
@@ -602,16 +648,19 @@ do_image() {
     tot=$(du -sB1 "$ROOTFS" 2>/dev/null | cut -f1); [ -n "$tot" ] || tot=0
     pause_for "build $IMG from $ROOTFS ($(numfmt --to=iec "$tot" 2>/dev/null || echo "$tot bytes"))" \
         "a few minutes"
+    # build-image.sh runs as root - it mounts the image and cp -a has to
+    # preserve the ownership inside the tree - but the last run handed this file
+    # to the invoking user. mke2fs happens to open an existing image without
+    # O_CREAT, so this does not fail today; it is one open flag away from doing
+    # so, and root rewriting a file it does not own is the shape that broke the
+    # log. Take it back, and let hand_over() give it up again at exit.
+    reclaim "$IMG"
     # build-image.sh mounts the image somewhere private, so watch the blocks
     # actually allocated to the sparse image file instead. Same shape, and it
     # is a real measurement rather than a guess.
     start_watch watch_du_file "$IMG" "$tot" "copying tree"
     run "$SCRIPTS/build-image.sh" "$ROOTFS" "$IMG" "$BLOCKS"
     stop_watch
-    # build-image.sh has to run as root - it mounts the image and cp -a needs to
-    # preserve the ownership inside the tree - but the file it leaves behind is
-    # the user's to delete or copy.
-    [ -n "$RUN_AS_USER" ] && chown "$RUN_AS_USER" "$IMG" 2>/dev/null || true
     say "computing md5 of the image"
     IMG_MD5=$(hexonly "$(md5_of "$IMG" "hashing image")")
     say "md5: $IMG_MD5"
@@ -710,7 +759,7 @@ cleanup_stick() {
     rmdir "$STICK_MNT" 2>/dev/null || true
     STICK_CLEANUP=""
 }
-trap 'cleanup_stick; ui_end' EXIT
+trap 'cleanup_stick; ui_end; hand_over_all' EXIT
 
 # Fills CAND_* arrays. Removable devices only - anything not removable is not
 # offered at all, because the failure mode is writing over the wrong disk.
@@ -923,8 +972,12 @@ EOF
 # ------------------------------------------------------------------ main flow
 
 : > "$LOG" || { echo "cannot write $LOG" >&2; exit 1; }
-# The user is the one who reads and deletes it.
-[ -n "$RUN_AS_USER" ] && chown "$RUN_AS_USER" "$LOG" 2>/dev/null
+# Root-owned for the run, the invoking user's group so both privilege levels
+# can append, handed over by the EXIT trap. See hand_over().
+if [ -n "$RUN_AS_USER" ]; then
+    chgrp "$(id -gn "$RUN_AS_USER" 2>/dev/null || echo "$RUN_AS_USER")" \
+        "$LOG" 2>/dev/null && chmod 664 "$LOG" 2>/dev/null || true
+fi
 [ "$(id -u)" = 0 ] || { echo "run with sudo - it writes to $ROOTFS" >&2; exit 1; }
 
 selftest_hash
