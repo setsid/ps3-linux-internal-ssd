@@ -80,6 +80,18 @@ else
     B=; N=; D=; G=; R=; C=; Y=
 fi
 
+# All cursor addressing and progress drawing goes to fd 3, bound to the
+# terminal - never to stdout. A function that draws the header while its own
+# stdout is being captured by a command substitution would otherwise return the
+# escape sequences as part of its value. That is not hypothetical: md5_of() did
+# exactly that, and the resulting hash mismatch was reported against two
+# identical-looking strings because the difference was invisible escapes.
+if [ "$UI" = fancy ] && { exec 3>/dev/tty; } 2>/dev/null; then
+    :
+else
+    exec 3>/dev/null
+fi
+
 TROWS=24; TCOLS=80
 term_size() {
     local sz
@@ -96,7 +108,12 @@ PHASE_NUM=0
 PHASE_TOTAL=7
 PHASE_NAME="starting"
 PHASE_WHY=""
+PHASE_WHY2=""
 PHASE_DETAIL=""
+PHASE_LABEL=""
+PHASE_CUR=0
+PHASE_TOT=0
+PHASE_EXTRA=""
 START_TS=$(date +%s)
 
 hms() {
@@ -104,23 +121,39 @@ hms() {
     printf '%02d:%02d:%02d' $((t/3600)) $((t%3600/60)) $((t%60))
 }
 
-bar() { # bar <current> <total> [width]
-    local cur=${1:-0} tot=${2:-0} w=${3:-32} pct filled
-    case "$cur$tot" in *[!0-9]*) return 0 ;; esac
-    [ "$tot" -gt 0 ] || return 0
-    pct=$(( cur * 100 / tot )); [ "$pct" -gt 100 ] && pct=100
-    filled=$(( pct * w / 100 ))
-    printf '[%s%s] %3d%%' \
-        "$(printf '%*s' "$filled" '' | tr ' ' '=')" \
-        "$(printf '%*s' $((w - filled)) '')" "$pct"
+# The one thing a user watches during a fifteen minute step, so it lives in the
+# fixed header rather than scrolling away, and carries the number as well as the
+# bar - at a glance a bar alone does not separate 70% from 80%.
+progress_line() {
+    local w=40 pct filled
+    [ -n "$PHASE_LABEL" ] || return 0
+    case "${PHASE_CUR}${PHASE_TOT}" in *[!0-9]*) PHASE_TOT=0 ;; esac
+    if [ "${PHASE_TOT:-0}" -gt 0 ]; then
+        pct=$(( PHASE_CUR * 100 / PHASE_TOT ))
+        [ "$pct" -gt 100 ] && pct=100
+        filled=$(( pct * w / 100 ))
+        printf '  %s%-16s%s %s%s%s%s%s  %s%3d%%%s  %s%s%s' \
+            "$B" "$PHASE_LABEL" "$N" \
+            "$C" "$(printf '%*s' "$filled" '' | tr ' ' '#')" "$N" \
+            "$D" "$(printf '%*s' $((w - filled)) '' | tr ' ' '.')" \
+            "$B" "$pct" "$N" \
+            "$D" "$PHASE_EXTRA" "$N"
+    else
+        printf '  %s%-16s%s  %s%s%s' "$B" "$PHASE_LABEL" "$N" \
+            "$D" "$PHASE_EXTRA" "$N"
+    fi
+}
+
+set_progress() { # set_progress <label> <cur> <tot> [extra]
+    PHASE_LABEL=$1; PHASE_CUR=$2; PHASE_TOT=$3; PHASE_EXTRA=${4:-}
 }
 
 ui_begin() {
     [ "$UI" = fancy ] || return 0
     term_size
-    printf '\033[2J\033[H'
-    printf '\033[%d;%dr' $((HDR_LINES + 1)) "$TROWS"
-    printf '\033[%d;1H' $((HDR_LINES + 1))
+    printf '\033[2J\033[H' >&3
+    printf '\033[%d;%dr' $((HDR_LINES + 1)) "$TROWS" >&3
+    printf '\033[%d;1H' $((HDR_LINES + 1)) >&3
     # Draw the block once before any output scrolls, otherwise the first screen
     # shows the body over an empty header and only settles at the next phase.
     ui_header
@@ -128,8 +161,8 @@ ui_begin() {
 
 ui_end() {
     [ "$UI" = fancy ] || return 0
-    printf '\033[r'
-    printf '\033[%d;1H\033[?25h' "$TROWS"
+    printf '\033[r' >&3
+    printf '\033[%d;1H\033[?25h' "$TROWS" >&3
 }
 trap 'ui_end' EXIT
 
@@ -138,21 +171,22 @@ trap 'ui_end' EXIT
 ui_header() {
     [ "$UI" = fancy ] || return 0
     local el; el=$(hms $(( $(date +%s) - START_TS )))
-    printf '\033[s\033[H'
-    printf '%s\033[K\n' "${C}${B}Debian on PS3 - installer${N}"
-    printf '%s\033[K\n' "${D}$(printf '%*s' $((TCOLS > 2 ? TCOLS - 1 : 79)) '' | tr ' ' '-')${N}"
-    printf '%s\033[K\n' "${B}Phase ${PHASE_NUM}/${PHASE_TOTAL}: ${PHASE_NAME}${N}   ${D}elapsed ${el}${N}"
-    printf '%s\033[K\n' "${PHASE_WHY:0:$((TCOLS - 1))}"
-    printf '%s\033[K\n' "${PHASE_WHY2:-}"
-    printf '%s\033[K\n' "${PHASE_DETAIL}"
-    printf '%s\033[K\n' "${D}log: ${LOG}${N}"
-    printf '%s\033[K\n' "${D}$(printf '%*s' $((TCOLS > 2 ? TCOLS - 1 : 79)) '' | tr ' ' '-')${N}"
-    printf '\033[u'
+    local rule; rule=$(printf '%*s' $((TCOLS > 2 ? TCOLS - 1 : 79)) '' | tr ' ' '-')
+    printf '\033[s\033[H' >&3
+    printf '%s\033[K\n' "${C}${B}Debian on PS3 - installer${N}" >&3
+    printf '%s\033[K\n' "${D}${rule}${N}" >&3
+    printf '%s\033[K\n' "${B}Phase ${PHASE_NUM}/${PHASE_TOTAL}: ${PHASE_NAME}${N}   ${D}elapsed ${el}${N}" >&3
+    printf '%s\033[K\n' "${PHASE_WHY:0:$((TCOLS - 1))}" >&3
+    printf '%s\033[K\n' "${PHASE_WHY2:-}" >&3
+    printf '%s\033[K\n' "$(progress_line)" >&3
+    printf '%s\033[K\n' "${D}log: ${LOG}${N}" >&3
+    printf '%s\033[K\n' "${D}${rule}${N}" >&3
+    printf '\033[u' >&3
 }
 
 phase() { # phase <n> <name> <why line 1> [why line 2]
     PHASE_NUM=$1; PHASE_NAME=$2; PHASE_WHY=${3:-}; PHASE_WHY2=${4:-}
-    PHASE_DETAIL=""
+    PHASE_DETAIL=""; PHASE_LABEL=""; PHASE_CUR=0; PHASE_TOT=0; PHASE_EXTRA=""
     if [ "$UI" = plain ]; then
         echo
         echo "=============================================================="
@@ -213,16 +247,13 @@ watch_fd0() { # watch_fd0 <pid> <total-bytes> <label>
     while kill -0 "$pid" 2>/dev/null; do
         pos=$(awk '/^pos:/{print $2; exit}' "/proc/$pid/fdinfo/0" 2>/dev/null)
         [ -n "$pos" ] || pos=0
-        if [ "$UI" = fancy ]; then
-            PHASE_DETAIL="$lbl $(bar "$pos" "$tot")"
-            ui_header
-        fi
+        set_progress "$lbl" "$pos" "$tot" \
+            "$(numfmt --to=iec "$pos" 2>/dev/null || echo "$pos") of $(numfmt --to=iec "$tot" 2>/dev/null || echo "$tot")"
+        ui_header
         sleep 0.5
     done
-    if [ "$UI" = fancy ]; then
-        PHASE_DETAIL="$lbl $(bar "$tot" "$tot")"
-        ui_header
-    fi
+    set_progress "$lbl" "$tot" "$tot" "done"
+    ui_header
 }
 
 WATCH_PID=""
@@ -245,10 +276,8 @@ watch_objs() { # watch_objs <dir> <target>
     while :; do
         n=$(find "$dir" -name '*.o' 2>/dev/null | wc -l)
         [ "$n" -gt "$tot" ] && tot=$n
-        if [ "$UI" = fancy ]; then
-            PHASE_DETAIL="compiling  $(bar "$n" "$tot")  ${n}/${tot} objects"
-            ui_header
-        fi
+        set_progress "compiling" "$n" "$tot" "${n}/${tot} objects"
+        ui_header
         sleep 5
     done
 }
@@ -266,10 +295,8 @@ run_counted() { # run_counted <label> <total> <pattern> -- cmd...
         printf '%s\n' "$line" >> "$LOG"
         case "$line" in
             $pat) n=$((n + 1))
-                  if [ "$UI" = fancy ] && [ "$tot" -gt 0 ]; then
-                      PHASE_DETAIL="$lbl  $(bar "$n" "$tot")  ${n}/${tot}"
-                      ui_header
-                  fi ;;
+                  set_progress "$lbl" "$n" "$tot" "${n}/${tot}"
+                  ui_header ;;
         esac
     done; }
     local rc=${PIPESTATUS[0]}
@@ -282,10 +309,9 @@ watch_du_file() { # watch_du_file <file> <total-bytes> <label>
     while :; do
         cur=$(du -sB1 "$f" 2>/dev/null | cut -f1)
         [ -n "$cur" ] || cur=0
-        if [ "$UI" = fancy ]; then
-            PHASE_DETAIL="$lbl  $(bar "$cur" "$tot")"
-            ui_header
-        fi
+        set_progress "$lbl" "$cur" "$tot" \
+            "$(numfmt --to=iec "$cur" 2>/dev/null || echo "$cur")"
+        ui_header
         sleep 2
     done
 }
@@ -517,8 +543,37 @@ do_image() {
     run "$SCRIPTS/build-image.sh" "$ROOTFS" "$IMG" "$BLOCKS"
     stop_watch
     say "computing md5 of the image"
-    IMG_MD5=$(md5_of "$IMG" "hashing image")
+    IMG_MD5=$(hexonly "$(md5_of "$IMG" "hashing image")")
     say "md5: $IMG_MD5"
+}
+
+# Reduce to the hex digits. Belt and braces alongside the fd 3 fix: whatever
+# else ends up in the string - escapes, "  -", a stray CR from a file edited on
+# Windows - cannot then turn a good copy into a reported mismatch.
+hexonly() {
+    local h=$1
+    h=$(printf '%s' "$h" | tr -cd '0-9a-fA-F')
+    printf '%s' "$h" | tr 'A-F' 'a-f'
+}
+
+# Hash a known buffer through both paths and assert they agree. Runs at every
+# start: the comparison this protects is the one thing standing between the
+# user and writing a truncated image, and a verifier that cries wolf on good
+# data teaches people to ignore it.
+selftest_hash() {
+    local t rc=0 direct viaui
+    t=$(mktemp); printf 'ps3disk self test\n' > "$t"
+    direct=$(hexonly "$(md5sum < "$t" | cut -d" " -f1)")
+    viaui=$(hexonly "$(md5_of "$t" "self test")")
+    rm -f "$t"
+    [ "${#direct}" = 32 ] || rc=1
+    [ "$direct" = "$viaui" ] || rc=1
+    if [ "$rc" != 0 ]; then
+        printf '%s%sself test failed:%s hashing is not comparable\n' "$R" "$B" "$N" >&2
+        printf '  direct [%s]\n  via ui [%s]\n' "$direct" "$viaui" >&2
+        printf '  refusing to run - a verify pass could not be trusted\n' >&2
+        exit 1
+    fi
 }
 
 md5_of() { # md5_of <file> <label> -> hash on stdout
@@ -529,7 +584,7 @@ md5_of() { # md5_of <file> <label> -> hash on stdout
     pid=$!
     watch_fd0 "$pid" "$tot" "$lbl"
     wait "$pid" || { rm -f "$out"; fail "md5 of $f failed"; }
-    cut -d' ' -f1 < "$out"
+    hexonly "$(cut -d' ' -f1 < "$out")"
     rm -f "$out"
 }
 
@@ -537,6 +592,15 @@ md5_of() { # md5_of <file> <label> -> hash on stdout
 
 IS_WSL=0
 grep -qi microsoft /proc/version 2>/dev/null && IS_WSL=1
+
+# DriveType 2 is removable. Anything else is never returned, so a system disk
+# cannot be offered even by accident.
+ps_removable() {
+    "$1" -NoProfile -Command \
+"Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=2' | ForEach-Object { \
+\"\$(\$_.DeviceID)|\$(\$_.VolumeName)|\$(\$_.Size)|\$(\$_.FileSystem)|\$(\$_.FreeSpace)\" }" \
+        2>/dev/null | tr -d '\r'
+}
 
 # sudo strips WSL's Windows interop entries from PATH, so `command -v
 # powershell.exe` finds nothing - and this tool requires sudo, so that is every
@@ -585,13 +649,16 @@ declare -a CAND_ID CAND_LABEL CAND_SIZE CAND_FS CAND_FREE
 scan_removable() {
     CAND_ID=(); CAND_LABEL=(); CAND_SIZE=(); CAND_FS=(); CAND_FREE=()
     if [ "$IS_WSL" = 1 ]; then
-        local ps out
+        local ps out try
         ps=$(find_powershell) || return 1
+        # powershell.exe on WSL is slow to come up cold and the first call can
+        # return nothing. Retrying is what made it work when pressed twice by
+        # hand; do it here instead of leaving the user to guess.
+        for try in 1 2 3; do
+            out=$(ps_removable "$ps") && [ -n "$out" ] && break
+            sleep 2
+        done
         # DriveType 2 is removable. Anything else is never listed.
-        out=$("$ps" -NoProfile -Command \
-"Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=2' | ForEach-Object { \
-\"\$(\$_.DeviceID)|\$(\$_.VolumeName)|\$(\$_.Size)|\$(\$_.FileSystem)|\$(\$_.FreeSpace)\" }" \
-            2>/dev/null | tr -d '\r')
         while IFS='|' read -r id label size fs free; do
             [ -n "$id" ] || continue
             CAND_ID+=("$id"); CAND_LABEL+=("${label:-(no label)}")
@@ -707,6 +774,7 @@ do_stick() {
         || fail "stopped at the user's request"
 
     [ -z "${IMG_MD5:-}" ] && IMG_MD5=$(md5_of "$IMG" "hashing image")
+    IMG_MD5=$(hexonly "$IMG_MD5")
 
     say "compressing to the stick"
     local dest="$STICK_MNT/$IMG_GZ_NAME" pid
@@ -738,7 +806,7 @@ EOF
     pid=$!
     watch_fd0 "$pid" "$gzsize" "verifying stick"
     wait "$pid" || { rm -f "$out"; fail "could not read back the stick copy"; }
-    check=$(cut -d' ' -f1 < "$out"); rm -f "$out"
+    check=$(hexonly "$(cut -d' ' -f1 < "$out")"); rm -f "$out"
     [ "$check" = "$IMG_MD5" ] \
         || fail "stick copy hashes $check, expected $IMG_MD5 - the stick is bad"
     say "${G}stick copy verified${N}"
@@ -749,6 +817,7 @@ EOF
 : > "$LOG" || { echo "cannot write $LOG" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || { echo "run with sudo - it writes to $ROOTFS" >&2; exit 1; }
 
+selftest_hash
 ui_begin
 [ "$UI" = plain ] && say "log: $LOG"
 detect_state
@@ -798,7 +867,7 @@ esac
 
 # ------------------------------------------------------------------- the end
 
-PHASE_NAME="finished"; PHASE_DETAIL=""; ui_header
+PHASE_NAME="finished"; PHASE_LABEL=""; PHASE_EXTRA=""; ui_header
 ui_end
 
 echo

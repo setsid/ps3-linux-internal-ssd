@@ -36,6 +36,12 @@ MB="${3:-}"
 MNT=/mnt/chk
 MANIFEST="$HERE/manifest.txt"
 
+# A hash is 32 hex digits and nothing else. The stick is FAT32 and manifest.txt
+# is readable from Windows, so a CR from an editor there would otherwise turn a
+# good write into a reported mismatch - and a verifier that cries wolf on good
+# data is worse than none.
+hexonly() { printf '%s' "$1" | tr -cd '0-9a-fA-F' | tr 'A-F' 'a-f'; }
+
 # Fill in whatever was not given from the manifest.
 if [ -f "$MANIFEST" ]; then
     [ -n "$EXPECT" ]   || EXPECT=$(sed -n 's/^md5=//p' "$MANIFEST" | head -1)
@@ -46,8 +52,12 @@ else
     USED_MANIFEST=no
 fi
 
+# Strip anything an editor on Windows may have added - the stick is FAT32.
+IMG_NAME=$(printf '%s' "$IMG_NAME" | tr -d '\r')
 IMG="$HERE/${IMG_NAME:-ps3root4g.img.gz}"
-MB="${MB:-4096}"
+MB=$(printf '%s' "$MB" | tr -cd '0-9')
+[ -n "$MB" ] || MB=4096
+EXPECT=$(hexonly "$EXPECT")
 STAMP=/tmp/write-image-ok
 
 rm -f "$STAMP"
@@ -56,6 +66,13 @@ rm -f "$STAMP"
     echo "No md5 given and no manifest.txt beside this script."
     echo "usage: write-image.sh <md5> [image.gz] [MiB]"
     exit 1; }
+
+# Catch a mangled hash before writing rather than after.
+if [ "${#EXPECT}" -ne 32 ]; then
+    echo "md5 is not 32 hex characters: [$EXPECT]"
+    echo "check manifest.txt on the stick, or pass the hash directly"
+    exit 1
+fi
 
 {
 echo "=== paths ==="
@@ -100,7 +117,7 @@ sync
 # good one until something reads the part that is missing.
 echo
 echo "=== md5 verify ==="
-GOT=$(dd if="$DEV" bs=1M count="$MB" 2>/dev/null | md5sum | cut -d' ' -f1)
+GOT=$(hexonly "$(dd if="$DEV" bs=1M count="$MB" 2>/dev/null | md5sum | cut -d' ' -f1)")
 echo "expected $EXPECT"
 echo "got      $GOT"
 [ "$GOT" = "$EXPECT" ] || { echo "MISMATCH - stopping"; exit 1; }
