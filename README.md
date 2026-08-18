@@ -8,6 +8,9 @@ result is a machine that boots Debian from the OtherOS region, sees every
 storage region the hypervisor exposes, and cannot accidentally write to the
 GameOS ones.
 
+**In a hurry? One script does the host side: [The easy way](#the-easy-way).**
+The numbered steps after it are reference, not homework.
+
 > **Upgrading from v1: your root device is renamed and this will stop the
 > machine booting.** The OtherOS region moves from `/dev/ps3da` to
 > `/dev/ps3dd`, which is what petitboot has always called it. Edit
@@ -25,38 +28,37 @@ GameOS ones.
 | Host machine | Linux with `gcc-powerpc64-linux-gnu`, `debootstrap`, `qemu-user-static`, `binfmt-support`, `e2fsprogs` |
 | Transfer | A USB stick, to carry the image and scripts to petitboot |
 
-Steps 0 to 6 run on the host machine. Steps 7, 8 and 9 happen at the console —
-7 and 8 at the petitboot shell, 9 is the reboot itself.
+## The easy way
 
-**Steps 0 to 4 and 7 are done once. Steps 5, 6, 8 and 9 are the rebuild loop.**
-Once the kernel is installed and the region is partitioned, iterating means
-build the image, copy it to the stick, write it, reboot — and nothing above
-that needs re-reading.
+**One script on the host, two at the console, then reboot. That is the whole
+process.** Nothing below this section is required reading.
 
-Which loop depends on what you changed. A userland change is 5, 6, 8, 9. A
-kernel change is 3, 4, 5, 6, 8, 9 — steps 3 and 4 first, or step 5 packages a
-tree that still contains the old `vmlinux` and you spend forty minutes writing
-and booting the kernel you were trying to replace.
-
-## The short way
-
-One tool drives everything on the host side and leaves you a stick that the
-console can use:
+On the host machine, from the root of this repository:
 
 ```
 sudo ./scripts/make-debian-installer.sh
 ```
 
 It works out what is already done, shows you a checklist, and offers to run
-everything outstanding, the rebuild loop only, or a single step. It calls the
-same scripts the numbered steps below call — it is a driver, not a
-reimplementation. If the two ever disagree, the scripts are right and the tool
-is the bug.
+everything outstanding, the rebuild loop only, or a single step. It pauses
+before each step to say what it is about to do and roughly how long that takes,
+keeps the real command output on screen and logs all of it unfiltered to a
+file, and picks the USB stick for you from the removable devices it can find.
+Non-removable disks are never offered.
 
-It pauses before each step to say what it is about to do and roughly how long
-that takes, keeps the real command output on screen and logs all of it
-unfiltered to a file, and picks the USB stick for you from the removable
-devices it can find. Non-removable disks are never offered.
+Then, at the petitboot shell on the console:
+
+```
+sh /tmp/petitboot/mnt/sda1/partition-region.sh    # first time only
+sh /tmp/petitboot/mnt/sda1/write-image.sh
+```
+
+Reboot, choose **debian** — not `debian-failsafe` — and you have Debian.
+
+`write-image.sh` needs no arguments — the tool writes a `manifest.txt` to the
+stick with the image name, hash, size and kernel release, and the script reads
+it. That is the last thing anyone had to transcribe by hand: a 32-character
+hash, typed at a television, on a USB keyboard, late at night.
 
 **How long.** First run is around 90 minutes: about 20 for debootstrap, 15 or
 more for the kernel depending on cores, the rest in image build, transfer and
@@ -68,28 +70,39 @@ it — it has not.
 exactly as the individual scripts do. That happens automatically when output is
 not a terminal, when `TERM` is dumb, or when `NO_COLOR` is set.
 
-Then, at the console:
+**To rebuild later**, run the same command again and pick the rebuild loop. The
+tool detects that the kernel is installed and the region is partitioned, and
+skips straight to build, transfer, write.
 
-```
-sh /tmp/petitboot/mnt/sda1/partition-region.sh    # first time only
-sh /tmp/petitboot/mnt/sda1/write-image.sh
-```
+Everything from here on is reference: what that tool is doing, how to do it by
+hand when something goes wrong in the middle, and why the two kernel patches
+exist. You do not need any of it to get a working machine.
 
-`write-image.sh` needs no arguments — the tool writes a `manifest.txt` to the
-stick with the image name, hash, size and kernel release, and the script reads
-it. That is the last thing anyone had to transcribe by hand: a 32-character
-hash, typed at a television, on a USB keyboard, late at night.
+## The long way: the steps, one at a time
 
-Reboot, choose **debian** — not `debian-failsafe` — and you have Debian.
-
-## The steps, one at a time
-
-The tool runs these. They are also the documentation of what it is doing, and
-the fallback when something goes wrong in the middle.
+`make-debian-installer.sh` runs exactly these. They are the documentation of
+what it is doing, and the fallback when a step fails and you want to pick up
+from the middle. It calls the same scripts these steps call — it is a driver,
+not a reimplementation. If the two ever disagree, the scripts are right and the
+tool is the bug.
 
 Every command below runs from the root of this repository, so script paths are
 relative to it. `~/ps3-linux` is the kernel tree from step 1 — adjust it
 throughout if you clone somewhere else.
+
+**Where each step runs.** Steps 0 to 6 run on the host machine. Steps 7, 8 and
+9 happen at the console — 7 and 8 at the petitboot shell, 9 is the reboot
+itself.
+
+**Steps 0 to 4 and 7 are done once. Steps 5, 6, 8 and 9 are the rebuild loop.**
+Once the kernel is installed and the region is partitioned, iterating means
+build the image, copy it to the stick, write it, reboot — and nothing above
+that needs re-reading.
+
+Which loop depends on what you changed. A userland change is 5, 6, 8, 9. A
+kernel change is 3, 4, 5, 6, 8, 9 — steps 3 and 4 first, or step 5 packages a
+tree that still contains the old `vmlinux` and you spend forty minutes writing
+and booting the kernel you were trying to replace.
 
 **Steps 0 and 1–3 are independent tracks.** One builds a Debian userland, the
 other builds a kernel. They share nothing and can run in either order, or at
