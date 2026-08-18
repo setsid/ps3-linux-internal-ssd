@@ -741,7 +741,4 @@ patch that is already large.
 - **René Rebe** for the bounce buffer offset fix carried as patch 0001, and
   Christoph Hellwig for reviewing it.
 
-Both drivers are GPL-2.0, so borrowing the approach outright is fine. The
-differences here are per-region private data instead of minor arithmetic, a
-shared tag set instead of implicit serialisation, read-only defaults, and
-staying inside one file.
+Both drivers are GPL-2.0.
