@@ -212,11 +212,40 @@ fail() {
     exit 1
 }
 
+# Least privilege. This tool needs root for debootstrap, the chroot work, mount
+# and umount, and writing into the rootfs tree - and for nothing else. Run
+# everything else as the invoking user, or they are left with a kernel tree of
+# thousands of root-owned files they cannot delete, edit or rebuild without
+# sudo. Falls back to running directly when invoked as root with no SUDO_USER,
+# so the tool still works in that case.
+RUN_AS_USER=""
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    RUN_AS_USER="$SUDO_USER"
+fi
+
+as_user() {
+    if [ -n "$RUN_AS_USER" ]; then
+        sudo -u "$RUN_AS_USER" -H "$@"
+    else
+        "$@"
+    fi
+}
+
 # Echo the command, run it, mirror its output to screen and log unfiltered.
 run() {
     printf '%s$ %s%s\n' "$D" "$*" "$N"
     printf '$ %s\n' "$*" >> "$LOG"
     "$@" 2>&1 | tee -a "$LOG"
+    local rc=${PIPESTATUS[0]}
+    [ "$rc" = 0 ] || fail "$1 exited $rc"
+}
+
+# As run(), but dropped to the invoking user. Used for everything that lands in
+# the user's own directories.
+runu() {
+    printf '%s$ %s%s\n' "$D" "$*" "$N"
+    printf '$ %s\n' "$*" >> "$LOG"
+    as_user "$@" 2>&1 | tee -a "$LOG"
     local rc=${PIPESTATUS[0]}
     [ "$rc" = 0 ] || fail "$1 exited $rc"
 }
@@ -335,7 +364,8 @@ watch_du() { # watch_du <pid> <dest> <total-bytes> <label>
 
 kernelrelease() {
     [ -f "$KDIR/.config" ] || return 1
-    make -s -C "$KDIR" ARCH=powerpc CROSS_COMPILE="$CROSS" kernelrelease 2>/dev/null
+    as_user make -s -C "$KDIR" ARCH=powerpc CROSS_COMPILE="$CROSS" \
+        kernelrelease 2>/dev/null
 }
 
 newer() { [ -e "$1" ] && [ -e "$2" ] && [ "$1" -nt "$2" ]; }
@@ -390,6 +420,31 @@ detect_state() {
         fi
     else
         ST_IMAGE=missing
+    fi
+}
+
+# Anyone who ran an earlier version has a tree full of root-owned files. Say so
+# and offer to fix it, rather than failing confusingly later or quietly building
+# as root again.
+check_ownership() {
+    [ -n "$RUN_AS_USER" ] || return 0
+    [ -d "$KDIR" ] || return 0
+    local stray
+    stray=$(find "$KDIR" ! -user "$RUN_AS_USER" -print -quit 2>/dev/null)
+    [ -n "$stray" ] || return 0
+
+    echo
+    warn "    $KDIR contains files not owned by $RUN_AS_USER."
+    warn "    An earlier version of this tool built the kernel as root, so the"
+    warn "    tree cannot be deleted, edited or rebuilt without sudo."
+    warn "    First one found: $stray"
+    echo
+    if confirm "    Fix it now with chown -R $RUN_AS_USER on $KDIR?"; then
+        run chown -R "$RUN_AS_USER:$(id -gn "$RUN_AS_USER")" "$KDIR"
+        say "ownership fixed"
+    else
+        warn "    Left as is. The build below runs as $RUN_AS_USER and will"
+        warn "    fail on any file it cannot write."
     fi
 }
 
@@ -451,7 +506,8 @@ do_ktree() {
     pause_for "clone the kernel tree into $KDIR" "a few minutes, network bound"
     # --progress: git suppresses its counter when stdout is not a terminal, and
     # here it is a pipe into tee. Its own figures are honest; do not invent any.
-    run git clone --progress --depth 1 \
+    as_user mkdir -p "$(dirname "$KDIR")"
+    runu git clone --progress --depth 1 \
         https://git.kernel.org/pub/scm/linux/kernel/git/geoff/ps3-linux.git "$KDIR"
 }
 
@@ -460,7 +516,7 @@ do_patch() {
         "Applying the two ps3disk patches: the bounce buffer offset fix, and" \
         "the multi-region patch that exposes every region read-only but one."
     pause_for "patch $KDIR" "seconds"
-    run "$SCRIPTS/kernel-patch.sh" "$KDIR"
+    runu "$SCRIPTS/kernel-patch.sh" "$KDIR"
 }
 
 do_build() {
@@ -469,15 +525,16 @@ do_build() {
         "kernel plus modules. Length depends on core count: $(nproc) here."
     pause_for "configure and build the kernel" \
         "15 minutes or more on $(nproc) cores"
-    run make -C "$KDIR" ARCH=powerpc ps3_defconfig
-    run "$SCRIPTS/kernel-config.sh" "$KDIR"
+    runu make -C "$KDIR" ARCH=powerpc ps3_defconfig
+    runu "$SCRIPTS/kernel-config.sh" "$KDIR"
     local target=1400
     [ -f "$KDIR/.ps3-objcount" ] && target=$(cat "$KDIR/.ps3-objcount")
     start_watch watch_objs "$KDIR" "$target"
     # Bare make: vmlinux alone would skip modules and step 4 would have none.
-    run make -C "$KDIR" ARCH=powerpc CROSS_COMPILE="$CROSS" -j"$(nproc)"
+    runu make -C "$KDIR" ARCH=powerpc CROSS_COMPILE="$CROSS" -j"$(nproc)"
     stop_watch
-    find "$KDIR" -name '*.o' 2>/dev/null | wc -l > "$KDIR/.ps3-objcount"
+    find "$KDIR" -name '*.o' 2>/dev/null | wc -l \
+        | as_user tee "$KDIR/.ps3-objcount" >/dev/null
     KREL=$(kernelrelease) || KREL=""
     say "kernel release: $KREL"
 }
@@ -486,6 +543,11 @@ do_rootfs() {
     phase 4 "Debian userland" \
         "debootstrap is unpacking a Debian sid userland for big-endian ppc64" \
         "and running its package scripts under qemu emulation - hence slow."
+    # $ROOTFS stays root-owned deliberately. It is a system tree with real
+    # uids and modes inside it - setuid binaries, /etc, device nodes - and
+    # build-image.sh copies it with cp -a to preserve exactly that. Chowning it
+    # to the invoking user would corrupt the image. This is the one place where
+    # root ownership is the correct outcome rather than an oversight.
     pause_for "build the Debian tree at $ROOTFS" \
         "about 20 minutes, host speed and emulation bound"
     # debootstrap announces each package as it unpacks. The total is learned
@@ -501,7 +563,8 @@ do_rootfs() {
         run_counted "unpacking" "$ptarget" 'I: *[UE][nx]*ing *' -- \
             "$SCRIPTS/build-rootfs.sh" "$ROOTFS"
     fi
-    ls "$ROOTFS/var/lib/dpkg/info"/*.list 2>/dev/null | wc -l > "$REPO/.ps3-pkgcount"
+    ls "$ROOTFS/var/lib/dpkg/info"/*.list 2>/dev/null | wc -l \
+        | as_user tee "$REPO/.ps3-pkgcount" >/dev/null
 }
 
 do_install() {
@@ -510,7 +573,9 @@ do_install() {
         "match. This is the only place a kernel enters the Debian tree."
     [ -n "$KREL" ] || KREL=$(kernelrelease) || fail "cannot determine kernel release"
     pause_for "install kernel $KREL into $ROOTFS" "a minute or two"
-    run "${CROSS}strip" -s -o /tmp/vmlinux-stripped "$KDIR/vmlinux"
+    # strip reads the user's tree and writes /tmp; the copy lands in the rootfs
+    # tree, which is root's. See the note on $ROOTFS ownership in do_rootfs().
+    runu "${CROSS}strip" -s -o /tmp/vmlinux-stripped "$KDIR/vmlinux"
     run cp /tmp/vmlinux-stripped "$ROOTFS/boot/vmlinux"
     local nko
     nko=$(find "$KDIR" -name '*.ko' 2>/dev/null | wc -l)
@@ -543,6 +608,10 @@ do_image() {
     start_watch watch_du_file "$IMG" "$tot" "copying tree"
     run "$SCRIPTS/build-image.sh" "$ROOTFS" "$IMG" "$BLOCKS"
     stop_watch
+    # build-image.sh has to run as root - it mounts the image and cp -a needs to
+    # preserve the ownership inside the tree - but the file it leaves behind is
+    # the user's to delete or copy.
+    [ -n "$RUN_AS_USER" ] && chown "$RUN_AS_USER" "$IMG" 2>/dev/null || true
     say "computing md5 of the image"
     IMG_MD5=$(hexonly "$(md5_of "$IMG" "hashing image")")
     say "md5: $IMG_MD5"
@@ -733,8 +802,19 @@ choose_stick() {
 mount_stick() {
     local i=$1 id="${CAND_ID[$1]}"
     STICK_DESC="$id  ${CAND_LABEL[$i]}  $(human "${CAND_SIZE[$i]}")  ${CAND_FS[$i]}"
+    # FAT has no on-disk ownership, so it comes from the mount. Ask for the
+    # invoking user's uid, and fall back if the option is rejected, so files
+    # written to the stick are theirs to manage afterwards.
+    local uidopt=""
+    if [ -n "$RUN_AS_USER" ]; then
+        uidopt="uid=$(id -u "$RUN_AS_USER"),gid=$(id -g "$RUN_AS_USER")"
+    fi
+
     if [ "$IS_WSL" = 1 ]; then
         STICK_MNT=$(mktemp -d)
+        if [ -n "$uidopt" ] && mount -t drvfs -o "$uidopt" "$id" "$STICK_MNT" 2>>"$LOG"; then
+            STICK_CLEANUP=1; return 0
+        fi
         if mount -t drvfs "$id" "$STICK_MNT" 2>>"$LOG"; then
             STICK_CLEANUP=1; return 0
         fi
@@ -744,6 +824,9 @@ mount_stick() {
     mnt=$(lsblk -rno MOUNTPOINT "$id" 2>/dev/null | head -1)
     if [ -n "$mnt" ]; then STICK_MNT="$mnt"; return 0; fi
     STICK_MNT=$(mktemp -d)
+    if [ -n "$uidopt" ] && mount -o "$uidopt" "$id" "$STICK_MNT" 2>>"$LOG"; then
+        STICK_CLEANUP=1; return 0
+    fi
     if mount "$id" "$STICK_MNT" 2>>"$LOG"; then STICK_CLEANUP=1; return 0; fi
     rmdir "$STICK_MNT" 2>/dev/null; warn "could not mount $id"; return 1
 }
@@ -777,6 +860,11 @@ do_stick() {
     [ -z "${IMG_MD5:-}" ] && IMG_MD5=$(md5_of "$IMG" "hashing image")
     IMG_MD5=$(hexonly "$IMG_MD5")
 
+    # This one stays as root rather than dropping to the user. The stick is
+    # FAT, which has no on-disk ownership - it comes from the mount, and
+    # mount_stick() asks for the invoking user's uid, so what lands there is
+    # already theirs. Running the write as the user instead would fail outright
+    # whenever that mount option was rejected, for no gain.
     say "compressing to the stick"
     local dest="$STICK_MNT/$IMG_GZ_NAME" pid
     ( gzip -1 -c < "$IMG" > "$dest" ) &
@@ -835,10 +923,13 @@ EOF
 # ------------------------------------------------------------------ main flow
 
 : > "$LOG" || { echo "cannot write $LOG" >&2; exit 1; }
+# The user is the one who reads and deletes it.
+[ -n "$RUN_AS_USER" ] && chown "$RUN_AS_USER" "$LOG" 2>/dev/null
 [ "$(id -u)" = 0 ] || { echo "run with sudo - it writes to $ROOTFS" >&2; exit 1; }
 
 selftest_hash
 ui_begin
+check_ownership
 [ "$UI" = plain ] && say "log: $LOG"
 detect_state
 show_state
