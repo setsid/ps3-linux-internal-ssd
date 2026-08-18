@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Build a Debian-on-PS3 installer stick, from nothing or from wherever you got
 # to last time.
 #
@@ -785,14 +786,33 @@ do_stick() {
 
     run cp "$SCRIPTS/partition-region.sh" "$SCRIPTS/write-image.sh" "$STICK_MNT/"
 
-    cat > "$STICK_MNT/manifest.txt" <<EOF
+    local mf="$STICK_MNT/manifest.txt"
+    cat > "$mf" <<EOF
 image=$IMG_GZ_NAME
 md5=$IMG_MD5
 size_mib=$SIZE_MIB
 kernel_release=${KREL:-unknown}
 built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
-    say "wrote manifest.txt"
+
+    # The no-argument console workflow depends entirely on this file, so read
+    # it back and check it parses rather than trusting the redirection.
+    [ -s "$mf" ] || fail "manifest.txt is empty or was not written"
+    local m_img m_md5 m_mib
+    m_img=$(sed -n 's/^image=//p'    "$mf" | head -1)
+    m_md5=$(sed -n 's/^md5=//p'      "$mf" | head -1)
+    m_mib=$(sed -n 's/^size_mib=//p' "$mf" | head -1)
+    [ -n "$m_img" ] || fail "manifest.txt has no image name"
+    [ "$m_img" = "$IMG_GZ_NAME" ] \
+        || fail "manifest.txt names $m_img, expected $IMG_GZ_NAME"
+    [ -e "$STICK_MNT/$m_img" ] \
+        || fail "manifest.txt names $m_img, which is not on the stick"
+    [ "${#m_md5}" = 32 ] && [ "$(hexonly "$m_md5")" = "$m_md5" ] \
+        || fail "manifest.txt md5 is not 32 hex characters: [$m_md5]"
+    [ "$m_md5" = "$IMG_MD5" ] \
+        || fail "manifest.txt md5 does not match the image"
+    case "$m_mib" in ''|*[!0-9]*) fail "manifest.txt size_mib is not a number: [$m_mib]" ;; esac
+    say "wrote and verified manifest.txt"
 
     run sync
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 # Persistent storage links for PS3 block devices.
 #
 # systemd's 60-persistent-storage.rules matches sd*, sr*, vd*, mmcblk*, cciss*

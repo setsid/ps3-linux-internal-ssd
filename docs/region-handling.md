@@ -162,10 +162,14 @@ bug as the offset regression that patch 0001 fixes, and just as hard to
 attribute. Deferring a request costs 3 ms and one log line; getting it wrong
 costs another 40-minute cycle chasing filesystem corruption.
 
-Returning `BLK_STS_DEV_RESOURCE` after `blk_mq_start_request()` is legal:
+The test happens **before** `blk_mq_start_request()`, not after. Starting a
+request tells the block layer the driver has taken it and arms its timeout;
+returning `BLK_STS_DEV_RESOURCE` says the opposite, that it was not taken and
+should be requeued. The block layer copes with the contradiction —
 `blk_mq_handle_dev_resource()` calls `__blk_mq_requeue_request()`, which
-releases the driver tag and resets `rq->state` to `MQ_RQ_IDLE` for a started
-request. `virtio_blk` does the same thing.
+releases the driver tag and resets `rq->state` to `MQ_RQ_IDLE` — but coping is
+not the same as correct, and a backstop that violates the interface in the one
+case it exists for is not worth having. Check first, start second.
 
 ### Completion
 

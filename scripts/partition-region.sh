@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
 # Partition the OtherOS region. Runs at the petitboot shell.
 #   sh /tmp/petitboot/mnt/sda1/partition-region.sh
 #
@@ -10,6 +11,13 @@
 #
 # Region geometry as created by glevand's create_hdd_region.sh on Evilnat
 # 4.93: 46137320 sectors, fixed regardless of drive size.
+#
+# That figure is checked, not assumed. This script writes a partition table,
+# and on a console whose firmware presents a different layout the assumption
+# would destroy whatever is actually there, unrecoverably. If you knowingly
+# have a different region size, override it:
+#
+#   EXPECTED_SECTORS=12345678 sh partition-region.sh
 
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
 HERE=$(dirname "$0")
@@ -49,6 +57,16 @@ have_partitions() {
 
 rm -f "$STAMP"
 
+# Override on the command line if your layout differs and you know it does.
+EXPECTED_SECTORS="${EXPECTED_SECTORS:-46137320}"
+
+# blockdev is not always present at the petitboot shell; sysfs always is.
+dev_sectors() {
+    blockdev --getsz "$DEV" 2>/dev/null && return 0
+    cat "/sys/class/block/${DEVNAME}/size" 2>/dev/null && return 0
+    return 1
+}
+
 ROOT_START=2048
 ROOT_END=37748735       # 18.0 GiB
 SWAP_START=37748736
@@ -64,6 +82,47 @@ echo "target: $DEV"
 echo
 echo "=== before ==="
 grep ps3dd /proc/partitions
+
+# Refuse to touch anything that is not the layout this script was written for.
+# The kernel patch goes out of its way to keep GameOS read-only; the script
+# that writes partition tables should be at least as careful.
+echo
+echo "=== checking the target ==="
+for d in ps3da ps3db ps3dc ps3dd; do
+    if [ -b "/dev/$d" ] || grep -q "[[:space:]]$d\$" /proc/partitions; then
+        echo "  /dev/$d present"
+    else
+        echo
+        echo "REFUSING TO CONTINUE"
+        echo "/dev/$d is missing, so this is not the expected OtherOS++ layout"
+        echo "or the disk has not finished enumerating. Nothing was written."
+        exit 1
+    fi
+done
+
+ACTUAL=$(dev_sectors) || ACTUAL=""
+echo "  $DEV is ${ACTUAL:-unknown} sectors, expected $EXPECTED_SECTORS"
+
+if [ -z "$ACTUAL" ]; then
+    echo
+    echo "REFUSING TO CONTINUE"
+    echo "Could not determine the size of $DEV. Nothing was written."
+    exit 1
+fi
+
+if [ "$ACTUAL" != "$EXPECTED_SECTORS" ]; then
+    echo
+    echo "REFUSING TO CONTINUE"
+    echo "$DEV is $ACTUAL sectors, expected $EXPECTED_SECTORS."
+    echo
+    echo "This does not look like the OtherOS region this script was written"
+    echo "for, and partitioning it would destroy whatever is there. Nothing"
+    echo "has been written."
+    echo
+    echo "If your layout really is different and you know the size is right:"
+    echo "  EXPECTED_SECTORS=$ACTUAL sh \$0"
+    exit 1
+fi
 
 echo
 echo "=== unmounting ==="

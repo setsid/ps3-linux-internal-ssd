@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
 # Write a gzipped root filesystem image to the OtherOS region and verify it.
 # Runs at the petitboot shell. Put this and the image on a USB stick together:
 #
@@ -30,6 +31,22 @@ else
     B=; N=; G=; R=; C=; D=
 fi
 DEV=/dev/ps3dd1
+REGION=/dev/ps3dd
+REGNAME=ps3dd
+
+# The md5 pass afterwards catches a bad write. It does not catch a write to the
+# right-looking name on the wrong layout, because by then the data is gone. So
+# check the geometry first and write nothing on a mismatch. Override if you
+# knowingly have a different region size.
+EXPECTED_SECTORS="${EXPECTED_SECTORS:-46137320}"
+ROOT_MIN_SECTORS="${ROOT_MIN_SECTORS:-36000000}"   # ~17.2 GiB
+ROOT_MAX_SECTORS="${ROOT_MAX_SECTORS:-39000000}"   # ~18.6 GiB
+
+dev_sectors() {
+    blockdev --getsz "$1" 2>/dev/null && return 0
+    cat "/sys/class/block/$2/size" 2>/dev/null && return 0
+    return 1
+}
 EXPECT="${1:-}"
 IMG_NAME="${2:-}"
 MB="${3:-}"
@@ -89,6 +106,33 @@ if [ "$USED_MANIFEST" = yes ]; then
 else
     echo "source: command line"
 fi
+
+echo
+echo "=== checking the target ==="
+RSEC=$(dev_sectors "$REGION" "$REGNAME") || RSEC=""
+PSEC=$(dev_sectors "$DEV" "${REGNAME}1") || PSEC=""
+echo "$REGION: ${RSEC:-unknown} sectors, expected $EXPECTED_SECTORS"
+echo "$DEV: ${PSEC:-unknown} sectors, expected $ROOT_MIN_SECTORS-$ROOT_MAX_SECTORS"
+
+if [ "$RSEC" != "$EXPECTED_SECTORS" ]; then
+    echo
+    echo "This does not look like the expected OtherOS++ layout."
+    echo "Expected $REGION = $EXPECTED_SECTORS sectors"
+    echo "Found    $REGION = ${RSEC:-unknown} sectors"
+    echo "Nothing has been written."
+    exit 1
+fi
+
+if [ -z "$PSEC" ] || [ "$PSEC" -lt "$ROOT_MIN_SECTORS" ] \
+   || [ "$PSEC" -gt "$ROOT_MAX_SECTORS" ]; then
+    echo
+    echo "$DEV is ${PSEC:-unknown} sectors, not the ~18 GiB root partition"
+    echo "this image is built for. Run partition-region.sh first and let it"
+    echo "finish cleanly."
+    echo "Nothing has been written."
+    exit 1
+fi
+echo "layout looks right"
 
 echo
 echo "=== image ==="

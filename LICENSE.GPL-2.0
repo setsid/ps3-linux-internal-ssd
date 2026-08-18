@@ -1,0 +1,8 @@
+The patches under patches/ modify files in the Linux kernel and are licensed
+GPL-2.0, matching the files they modify.
+
+The full text of the GNU General Public License version 2 is at:
+
+    https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+
+and in any Linux kernel source tree, in the file COPYING.

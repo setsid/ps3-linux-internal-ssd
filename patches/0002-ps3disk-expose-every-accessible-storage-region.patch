@@ -80,9 +80,11 @@ Not upstream. Region 0 is only reachable on custom firmware, and the
 read-only policy is specific to the OtherOS++ layout.
 
 Based on Linux 6.4.
+
+SPDX-License-Identifier: GPL-2.0
 ---
- drivers/block/ps3disk.c | 389 ++++++++++++++++++++++++++++++++++++++++++++++++------------
- 1 file changed, 312 insertions(+), 77 deletions(-)
+ drivers/block/ps3disk.c | 398 ++++++++++++++++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 320 insertions(+), 78 deletions(-)
 
 --- a/drivers/block/ps3disk.c
 +++ b/drivers/block/ps3disk.c
@@ -184,7 +186,7 @@ Based on Linux 6.4.
  	default:
  		blk_dump_rq_flags(req, DEVICE_NAME " bad request");
  		return BLK_STS_IOERR;
-@@ -183,14 +217,27 @@
+@@ -183,14 +217,34 @@
  				     const struct blk_mq_queue_data *bd)
  {
  	struct request_queue *q = hctx->queue;
@@ -194,15 +196,18 @@ Based on Linux 6.4.
  	struct ps3disk_private *priv = ps3_system_bus_get_drvdata(&dev->sbd);
  	blk_status_t ret;
  
- 	blk_mq_start_request(bd->rq);
- 
- 	spin_lock_irq(&priv->lock);
--	ret = ps3disk_do_request(dev, bd->rq);
++	spin_lock_irq(&priv->lock);
++
 +	if (priv->req) {
 +		/*
 +		 * The shared tag set should make this unreachable; see the
 +		 * comment above ps3disk_probe().  Defer rather than overwrite
 +		 * the bounce buffer and the in flight command tag.
++		 *
++		 * Tested before blk_mq_start_request() rather than after:
++		 * starting a request tells the block layer the driver has
++		 * taken it and arms its timeout, which contradicts returning
++		 * BLK_STS_DEV_RESOURCE to say it was not taken.
 +		 */
 +		spin_unlock_irq(&priv->lock);
 +		dev_err_once(&dev->sbd.core,
@@ -210,11 +215,16 @@ Based on Linux 6.4.
 +			     __func__, __LINE__);
 +		return BLK_STS_DEV_RESOURCE;
 +	}
++
+ 	blk_mq_start_request(bd->rq);
 +	ret = ps3disk_do_request(dev, rp, bd->rq);
+ 
+-	spin_lock_irq(&priv->lock);
+-	ret = ps3disk_do_request(dev, bd->rq);
  	spin_unlock_irq(&priv->lock);
  
  	return ret;
-@@ -202,6 +249,7 @@
+@@ -202,6 +256,7 @@
  	struct ps3disk_private *priv;
  	struct request *req;
  	int res, read;
@@ -222,7 +232,7 @@ Based on Linux 6.4.
  	blk_status_t error;
  	u64 tag, status;
  	const char *op;
-@@ -254,7 +302,12 @@
+@@ -254,7 +309,12 @@
  	blk_mq_end_request(req, error);
  	spin_unlock(&priv->lock);
  
@@ -236,7 +246,7 @@ Based on Linux 6.4.
  	return IRQ_HANDLED;
  }
  
-@@ -370,6 +423,53 @@
+@@ -370,6 +430,53 @@
  	return 0;
  }
  
@@ -290,7 +300,7 @@ Based on Linux 6.4.
  static unsigned long ps3disk_mask;
  
  static DEFINE_MUTEX(ps3disk_mask_mutex);
-@@ -378,14 +478,113 @@
+@@ -378,14 +485,113 @@
  	.queue_rq	= ps3disk_queue_rq,
  };
  
@@ -408,7 +418,7 @@ Based on Linux 6.4.
  
  	if (dev->blk_size < 512) {
  		dev_err(&dev->sbd.core,
-@@ -394,26 +593,22 @@
+@@ -394,26 +600,22 @@
  		return -EINVAL;
  	}
  
@@ -446,7 +456,7 @@ Based on Linux 6.4.
  
  	dev->bounce_size = BOUNCE_SIZE;
  	dev->bounce_buf = kmalloc(BOUNCE_SIZE, GFP_DMA);
-@@ -426,58 +621,95 @@
+@@ -426,58 +628,95 @@
  	if (error)
  		goto fail_free_bounce;
  
@@ -582,7 +592,7 @@ Based on Linux 6.4.
  fail_teardown:
  	ps3stor_teardown(dev);
  fail_free_bounce:
-@@ -485,10 +717,6 @@
+@@ -485,10 +724,6 @@
  fail_free_priv:
  	kfree(priv);
  	ps3_system_bus_set_drvdata(_dev, NULL);
@@ -593,7 +603,7 @@ Based on Linux 6.4.
  	return error;
  }
  
-@@ -497,13 +725,20 @@
+@@ -497,13 +732,20 @@
  	struct ps3_storage_device *dev = to_ps3_storage_device(&_dev->core);
  	struct ps3disk_private *priv = ps3_system_bus_get_drvdata(&dev->sbd);
  

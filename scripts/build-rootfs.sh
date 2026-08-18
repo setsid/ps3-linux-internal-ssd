@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Build a Debian sid ppc64 root filesystem tree for the PS3.
 # Runs on the development machine, under qemu-user emulation.
 #
@@ -217,9 +218,44 @@ echo "Create $USERNAME. You will be asked for its password."
 in_chroot_tty adduser "$USERNAME"
 in_chroot adduser "$USERNAME" sudo
 
+# systemctl in a chroot can complain while still doing the right thing, so the
+# exit status is not worth much - but the outcome is. The README promises the
+# machine comes up reachable over SSH on DHCP, and if networkd is not actually
+# enabled the user boots a PS3 with no network and no way in except a
+# television, after being told the build succeeded. Check the symlinks.
 in_chroot systemctl enable ssh || true
 in_chroot systemctl enable systemd-networkd || true
 in_chroot systemctl enable systemd-resolved || true
+
+echo
+echo "=== checking services are really enabled ==="
+WANTS="$ROOTFS/etc/systemd/system/multi-user.target.wants"
+missing=
+for unit in ssh.service systemd-networkd.service; do
+    if [ -e "$WANTS/$unit" ]; then
+        echo "  $unit enabled"
+    else
+        echo "  $unit NOT enabled"
+        missing="$missing $unit"
+    fi
+done
+
+# resolved links from a different target on some versions; check both.
+if [ -e "$WANTS/systemd-resolved.service" ] \
+   || [ -e "$ROOTFS/etc/systemd/system/sysinit.target.wants/systemd-resolved.service" ]; then
+    echo "  systemd-resolved.service enabled"
+else
+    echo "  systemd-resolved.service NOT enabled"
+    missing="$missing systemd-resolved.service"
+fi
+
+if [ -n "$missing" ]; then
+    echo
+    echo "FAILED: these services are not enabled:$missing"
+    echo "The machine would boot without them. Fix before building an image:"
+    echo "  chroot $ROOTFS systemctl enable$missing"
+    exit 1
+fi
 
 # The resolv.conf copied in for the chroot points at the build host's resolver,
 # which the PS3 cannot reach. Hand DNS to systemd-resolved instead.

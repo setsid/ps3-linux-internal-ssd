@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Build a bootable root filesystem image from a debootstrapped tree.
 # Runs on the development machine.
 #

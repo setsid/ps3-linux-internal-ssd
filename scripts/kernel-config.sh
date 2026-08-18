@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Layer the options a modern Debian userland needs on top of ps3_defconfig.
 # Run after ps3_defconfig, and after kernel-patch.sh.
 #

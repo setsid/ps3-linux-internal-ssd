@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Apply both driver patches to a PS3 kernel tree.
 #
 #   ./kernel-patch.sh [kernel-tree]

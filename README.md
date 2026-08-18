@@ -547,5 +547,13 @@ the work below is other people's and is credited because this builds on it.
 
 ## Licence
 
-Kernel patches are GPL-2.0, matching the files they modify. Scripts and
-documentation are MIT. See [LICENSE](LICENSE).
+Two licences, split so a scanner can identify them:
+
+| | |
+|---|---|
+| `patches/` | GPL-2.0, matching the kernel files they modify — [LICENSE.GPL-2.0](LICENSE.GPL-2.0) |
+| `scripts/`, `docs/`, this README | MIT — [LICENSE](LICENSE) |
+
+Every file carries an `SPDX-License-Identifier` saying which applies. `LICENSE`
+is the MIT text verbatim with nothing above it, because prose in front of it is
+what made GitHub report the repository as `NOASSERTION`.

@@ -1,7 +1,3 @@
-Kernel patches under patches/ are GPL-2.0, matching the files they modify.
-
-Everything else:
-
 MIT License
 
 Copyright (c) 2026 setsid

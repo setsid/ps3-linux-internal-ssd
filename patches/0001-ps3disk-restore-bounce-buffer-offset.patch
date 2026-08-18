@@ -16,6 +16,8 @@ Fixes: 6e0a48552b8c ("ps3disk: use memcpy_{from,to}_bvec")
 
 Applied here against 6.4. Upstream version posted to linux-block in
 November 2025 and reviewed by Christoph Hellwig.
+
+SPDX-License-Identifier: GPL-2.0
 ---
  drivers/block/ps3disk.c | 2 ++
  1 file changed, 2 insertions(+)
