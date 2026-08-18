@@ -48,6 +48,13 @@ intended. Everything except the OtherOS region is read-only by default, because
 region 1 is the GameOS installation. If you genuinely mean it,
 `ps3disk.writable=<mask>` on the kernel command line.
 
+**Wiped `/dev/ps3dd` from Debian and lost the root filesystem.** The region has
+the same name from petitboot and from Debian, so a command aimed at one runs
+happily on the other. From Debian, `/dev/ps3dd` is the disk you are booted from.
+The read-only defaults protect the regions you might damage by accident; they
+cannot protect the one you are running from. Do partition-table work at the
+petitboot shell. Recovery is a fresh `partition-region.sh` and `write-image.sh`.
+
 **A region is missing from `/proc/partitions`.** Check `dmesg` for the
 `not selected` / `not accessible` lines the driver prints for every region it
 skips. `not selected` means `ps3disk.regions=` excluded it; `not accessible`
@@ -174,6 +181,22 @@ one.
 does not place the kernel `.config`, so `mkinitramfs` cannot check for
 `CONFIG_RD_ZSTD` and assumes it is available. Harmless — it only affects a
 capability check. README step 4 copies the config in to silence it.
+
+**`partition-region.sh` finished but there is no swap, or `mkswap` said
+`No such file or directory`.** parted wrote the table but the running petitboot
+kernel did not re-read it, so `/dev/ps3dd2` did not exist. parted's own `print`
+shows both partitions while `/proc/partitions` shows only `ps3dd1`.
+
+The script now retries a re-read, waits for both partitions, and stops with
+instructions rather than continuing. If it tells you to reboot petitboot and
+run it again, do that — the table survives the reboot and the second run
+completes. Do not run `write-image.sh` in between.
+
+Left undetected this is expensive: swap is never formatted, and the first boot
+hangs 90 seconds on the swap unit before giving up. An old swap signature from a
+previous run can also make a failed `mkswap` look like it worked, which is why
+the script now confirms the `ps3swap` label rather than trusting the exit
+status alone.
 
 ## Network and apt
 

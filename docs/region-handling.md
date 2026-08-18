@@ -222,6 +222,19 @@ first partition scan and any udev probe already see a read-only device.
 Partitions inherit it: `bdev_read_only()` checks `get_disk_ro()` on the parent
 disk, and `bio_check_ro()` rejects writes in `submit_bio_noacct()`.
 
+### What the read-only default does not protect
+
+> **`/dev/ps3dd` means the same region from petitboot and from booted Debian.**
+> That is the point of the naming, but it makes a destructive command ambiguous
+> about where it is meant to be run — and from Debian it is the live root disk.
+> `dd` over the first megabytes of `/dev/ps3dd` from a running system to clear
+> the GPT destroys the filesystem you are logged into.
+>
+> Read-only covers `ps3da`, `ps3db` and `ps3dc` — the regions you could damage
+> by accident. It cannot cover `ps3dd`, because that is the one you are running
+> from. Partition-table work on the OtherOS region belongs at the petitboot
+> shell, not in Debian.
+
 ### Why the default matters this much
 
 Region 1 on this console is roughly 870 GB of games and the UFS2 filesystem

@@ -884,6 +884,11 @@ echo
 echo "    ${B}sh /tmp/petitboot/mnt/sda1/partition-region.sh${N}   ${D}# first time only${N}"
 echo "    ${B}sh /tmp/petitboot/mnt/sda1/write-image.sh${N}"
 echo
+echo "  Both scripts stop on failure and say why. A good partition run ends"
+echo "  with ${B}ps3swap label confirmed${N}, and a good write ends with"
+echo "  ${B}write complete and verified${N}. Anything else, read the log on the"
+echo "  stick before going on."
+echo
 echo "  write-image.sh takes no arguments - it reads manifest.txt from the"
 echo "  stick for the hash, image name and size, so there is nothing to type."
 echo "  The manifest also tells you a week later which build is on the stick."

@@ -156,9 +156,30 @@ umount "$MNT"
 
 # Root boots by LABEL=, so the labels have to resolve. e2label is not present
 # in petitboot; blkid is.
+#
+# A hard check, not a listing. This section used to print whatever blkid found
+# and carry on: a run where ps3dd2 did not exist showed one line under a heading
+# saying both must be found, and then reported success. A check that passes when
+# the thing it checks is absent is worse than no check.
 echo
 echo "=== labels (both must be found) ==="
-blkid "$DEV" /dev/ps3dd2
+blkid "$DEV" /dev/ps3dd2 2>&1
+
+for pair in "$DEV ps3root" "/dev/ps3dd2 ps3swap"; do
+    d=${pair% *}
+    want=${pair#* }
+    out=$(blkid "$d" 2>/dev/null)
+    case "$out" in
+        *"LABEL=\"$want\""*) ;;
+        *)
+            echo
+            echo "MISSING: $d has no $want label"
+            echo "Run partition-region.sh and let it finish cleanly, then"
+            echo "run this script again."
+            exit 1 ;;
+    esac
+done
+echo "both labels confirmed"
 
 echo
 echo "write complete and verified"
