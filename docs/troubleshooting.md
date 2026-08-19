@@ -35,11 +35,11 @@ enough on every boot here, and raising it to 60 only makes a successful boot
 slower.
 
 **`root=/dev/ps3dd1` never appears under Linux.** A mainline kernel without
-`patches/0002` exposes one region and calls it `ps3da`, whatever it contains.
-With `0002` every accessible region appears under the same name petitboot uses,
+`patches/0001` exposes one region and calls it `ps3da`, whatever it contains.
+With `0001` every accessible region appears under the same name petitboot uses,
 so `ps3dd1` is correct in both.
 
-If you are coming from the first version of `0002` — the `__fls` hack — your
+If you are coming from the first version of that patch — the `__fls` hack — your
 configuration says `ps3da1` and needs to say `ps3dd1`. See
 [migration.md](migration.md).
 
@@ -91,7 +91,7 @@ dd if=/dev/ps3dd1 bs=1M count=4096 | md5sum
 dd if=/dev/ps3dd1 bs=1M count=4096 | md5sum
 ```
 
-The two commands are identical on purpose. Since `0002` both kernels call the
+The two commands are identical on purpose. Since `0001` both kernels call the
 region `ps3dd`, so this reads the same bytes off the same device through two
 different drivers. Under v1 the second would have been `ps3da1`. Differing
 hashes on the same bytes is conclusive.
@@ -232,11 +232,13 @@ When the storage path is corrupting data, everything above it looks broken.
 - the "Skip all ACL Checks" LV1 patch in Evilnat's CFW settings, in either state
 - symlink handling across the usr-merge during `run-init`
 
-The actual cause of all of it was the bounce buffer offset, `patches/0001`.
-The diagnostic that settles it in one step is hashing the same bytes from both
+The actual cause of all of it was the bounce buffer offset, which this
+repository carried as `patches/0001` until it went upstream in 6.19. The
+diagnostic that settles it in one step is hashing the same bytes from both
 kernels: if `dd if=/dev/ps3dd1 bs=1M count=4096 | md5sum` differs between
-petitboot's 2.6.30 and the 6.4 kernel, the filesystem is fine and the driver is
-not.
+petitboot's 2.6.30 and the running kernel, the filesystem is fine and the
+driver is not. On 7.1.8 the fix is already in the tree and `kernel-patch.sh`
+refuses to build without it, so a difference here points at something else.
 
 ## Region layout reference
 

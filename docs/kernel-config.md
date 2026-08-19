@@ -61,6 +61,14 @@ the request did nothing. systemd does not use that controller, and enabling perf
 on a 256 MB machine to satisfy it is not a trade worth making, so the request is
 gone rather than granted.
 
+`PROC_PID_CPUSET` was set for 6.4 and is not set now. Since the cgroup v1
+controllers became separately configurable it depends on `CPUSETS_V1`, which is
+deprecated and defaults to `n`, so on 6.13 or later the script asked for a
+symbol it could not get and failed its own post-check. It only provides the
+legacy `/proc/<pid>/cpuset` file. systemd drives cgroup v2, which `CPUSETS`
+alone still gives, so the symbol is dropped rather than propped up by enabling
+v1 cpuset code for an interface nothing here reads.
+
 ### namespaces
 
 `CONFIG_NAMESPACES` and the individual types.
@@ -102,13 +110,14 @@ make -s kernelrelease
 That string is the directory name under `/lib/modules`, and it is the argument
 `mkinitramfs` needs in README step 4.
 
-It is not fixed across trees. A clean clone configured by this script gives
-`6.4.0+`; a tree built before under other settings can give something longer.
-Never copy a release string out of documentation.
+It is not fixed across trees. The 7.1.8 tarball configured by this script gives
+a bare `7.1.8`; a tree built before under other settings can give something
+longer. Never copy a release string out of documentation.
 
-The trailing `+` appears when HEAD is not on an exact tag and is part of the
-string: `6.4.0+` and `6.4.0` are different directories. Copy what
-`kernelrelease` prints, including any `+`.
+The trailing `+` appears when `CONFIG_LOCALVERSION_AUTO` finds a git tree whose
+HEAD is not on an exact tag, so an unpacked tarball never grows one. Where it
+does appear it is part of the string: `7.1.8+` and `7.1.8` are different
+directories. Copy what `kernelrelease` prints, including any `+`.
 
 Set `CONFIG_LOCALVERSION="-something"` yourself if you want a distinguishable
 suffix, but it is optional. Whatever you choose, re-read `kernelrelease`
@@ -117,23 +126,28 @@ directory name matches.
 
 ## Size
 
-`vmlinux` comes out around 143 MB unstripped. Petitboot has to kexec it into a
-machine with 256 MB of RAM alongside the initrd and itself, so strip it:
+`vmlinux` comes out around 210 MB unstripped on 7.1.8. Petitboot has to kexec
+it into a machine with 256 MB of RAM alongside the initrd and itself, so strip
+it:
 
 ```
 powerpc64-linux-gnu-strip -s -o vmlinux-stripped vmlinux
 ```
 
-That gets it to roughly 19 MB.
+That gets it to 20.5 MiB, measured on the 7.1.8 build with gcc 11.4.0. The 6.4
+build stripped to about 19 MiB.
 
-## Verifying both patches survived a rebuild
+## Verifying the patch survived a rebuild
 
 ```
-grep -q 'offset += bvec.bv_len'      drivers/block/ps3disk.c && echo 0001 ok
-grep -q 'ps3disk_find_otheros_region' drivers/block/ps3disk.c && echo 0002 ok
+grep -q 'offset += bvec.bv_len'       drivers/block/ps3disk.c && echo upstream fix present
+grep -q 'ps3disk_find_otheros_region' drivers/block/ps3disk.c && echo 0001 ok
 ```
 
-Both patches touch only `drivers/block/ps3disk.c`. If
+The first line is upstream as of 6.19, not something this repository applies;
+`kernel-patch.sh` refuses to run without it. The second is `patches/0001`.
+
+The patch touches only `drivers/block/ps3disk.c`. If
 `drivers/ps3/ps3stor_lib.c` differs from upstream, something has gone wrong —
 the earlier `__fls` hack was withdrawn, not superseded:
 

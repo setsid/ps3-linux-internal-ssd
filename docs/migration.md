@@ -6,7 +6,7 @@ If you are running the earlier `0002-ps3stor-select-otheros-region.patch` (the
 `__fls` hack), your OtherOS region is `/dev/ps3da` and your partitions are
 `ps3da1` and `ps3da2`.
 
-After `0002-ps3disk-expose-every-accessible-storage-region.patch`, the same
+After `0001-ps3disk-expose-every-accessible-storage-region.patch`, the same
 region is `/dev/ps3dd`, with partitions `ps3dd1` and `ps3dd2` — the names
 petitboot has always used for it.
 

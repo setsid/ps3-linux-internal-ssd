@@ -211,7 +211,7 @@ echo "ps3dd1 should be $(( (ROOT_END - ROOT_START + 1) / 2 ))"
 
 # Only swap gets formatted here. The root filesystem is written as a whole
 # image built on the development machine - petitboot's e2fsprogs is 1.41.12
-# from 2010 and produces group descriptors that 6.4 ext4 rejects.
+# from 2010 and produces group descriptors that 7.1.8 ext4 rejects.
 echo
 echo "=== mkswap ==="
 run_or_die "mkswap on ${DEV}2" mkswap -L ps3swap "${DEV}2"

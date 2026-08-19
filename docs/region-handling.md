@@ -1,6 +1,6 @@
 # Region handling in `ps3disk`
 
-Design notes for `patches/0002-ps3disk-expose-every-accessible-storage-region.patch`.
+Design notes for `patches/0001-ps3disk-expose-every-accessible-storage-region.patch`.
 
 This is the reasoning behind the patch, including the parts that were
 considered and rejected. Testing on this hardware costs about 40 minutes per
@@ -131,7 +131,9 @@ there is no second tag.
 This is how SCSI serialises several LUNs behind a host adapter with
 `can_queue == 1`: one tag set per host, one request queue per LUN.
 
-Three details that could have broken it, checked against the 6.4 source:
+Three details that could have broken it, checked against the 6.4 source. They
+were not re-derived from 7.1.8; see [Porting forward](#porting-forward) for what
+was and was not re-checked on the newer tree:
 
 - **Adding queues later.** `blk_mq_add_queue_tag_set()` sets
   `BLK_MQ_F_TAG_QUEUE_SHARED` on the transition from one queue to two and
@@ -155,8 +157,8 @@ Three details that could have broken it, checked against the 6.4 source:
 
 This should be unreachable. It is there because the failure mode if the
 reasoning above is wrong is silent bounce buffer corruption — the same class of
-bug as the offset regression that patch 0001 fixes. Deferring a request costs
-3 ms and one log line.
+bug as the offset regression that used to be patch 0001 here. Deferring a
+request costs 3 ms and one log line.
 
 The test happens **before** `blk_mq_start_request()`, not after. Starting a
 request tells the block layer the driver has taken it and arms its timeout;
@@ -443,7 +445,7 @@ lines once at boot, and it is the only feedback available without a debugger.
 | Console | PS3 Slim CECH-2503B, NOR flash |
 | Firmware | Evilnat CFW 4.93 Cobra 8.5 CEX |
 | Drive | Kingston SA400S37960G, 960 GB, internal |
-| Kernel | 6.4.0-g98ec4e7cee0f+ |
+| Kernel | 6.4.0-g98ec4e7cee0f+, with the two-patch series as it stood on 6.4 |
 | Userland | Debian sid ppc64, big-endian |
 
 ```
@@ -616,24 +618,25 @@ and `pmem*`; `ps3d*` matches none of them, so the `blkid` builtin never runs and
 `/dev/disk` is never created at all. That is an upstream gap in systemd, not
 something the driver can or should fix.
 
-## Porting forward
+## The port to 7.1.8
 
-Written against Linux 6.4 (Geoff Levand's `ps3-linux`, close enough to
-`v6.4` that the patch was generated against the pristine tag). Two block-layer
-changes after 6.4 affect this file. Both are in `ps3disk_add_region()`, which
-is where the queue setup was deliberately collected.
+The patch was written against Linux 6.4 (Geoff Levand's `ps3-linux`, close
+enough to `v6.4` that it was generated against the pristine tag). It is now
+generated against pristine 7.1.8. Three changes were needed, all inside this
+file: `drivers/ps3/ps3stor_lib.c`, `asm/ps3stor.h`, `ps3rom` and `ps3flash`
+were untouched then and are untouched now.
 
-**6.9** — `blk_mq_alloc_disk()` takes a `struct queue_limits *`, and the
-`blk_queue_*` setters are replaced by fields in it. Upstream converted
-`ps3disk` in the same release. In `ps3disk_add_region()`, replace the
-allocation and the six setters with:
+**6.9 — `queue_limits`.** `blk_mq_alloc_disk()` takes a `struct queue_limits *`
+and the six `blk_queue_*` setters are gone, replaced by fields in it. Upstream
+converted `ps3disk` in the same release. The initialiser lives in
+`ps3disk_add_region()`:
 
 ```c
 struct queue_limits lim = {
 	.logical_block_size	= dev->blk_size,
-	.max_hw_sectors		= BOUNCE_SIZE >> 9,
+	.max_hw_sectors		= dev->bounce_size >> 9,
 	.max_segments		= -1,
-	.max_segment_size	= BOUNCE_SIZE,
+	.max_segment_size	= dev->bounce_size,
 	.dma_alignment		= dev->blk_size - 1,
 	.features		= BLK_FEAT_WRITE_CACHE | BLK_FEAT_ROTATIONAL,
 };
@@ -641,49 +644,99 @@ struct queue_limits lim = {
 gendisk = blk_mq_alloc_disk(&priv->tag_set, &lim, rp);
 ```
 
-**6.14** — `BLK_MQ_F_SHOULD_MERGE` was removed; pass `0` as the flags argument
-to `blk_mq_alloc_sq_tag_set()`. Upstream `ps3disk` at v6.17 already does.
+Per region, not at the top of `ps3disk_probe()`, and it should not be tidied
+upward. `probe()` assigns `dev->bounce_size` before the region loop runs, so
+inside `add_region()` the limits can name it directly. Upstream put its own
+initialiser at the top of `probe()`, where it read `dev->bounce_size` one line
+before the assignment; Geert Uytterhoeven fixed that in January 2025 by
+substituting the `BOUNCE_SIZE` constant instead. Keeping the initialiser per
+region means the ordering hazard cannot recur.
 
-Nothing else in the patch depends on block-layer API that has moved.
-`set_disk_ro()`, `device_add_disk()`, `del_gendisk()`, `put_disk()`,
-`bitmap_find_next_zero_area()` and the tag-set sharing behaviour are all
-unchanged as of v6.17.
+`BLK_FEAT_ROTATIONAL` reproduces what the driver did before the conversion,
+when queues were rotational unless told otherwise. It is arguably wrong for an
+SSD, but it is what 6.4 effectively did, and it reaches only the `rotational`
+sysfs attribute and the I/O scheduler hint. Changing it is a separate decision,
+not part of this port.
 
-Re-check patch 0001 when moving up. Upstream
-`drivers/block/ps3disk.c` at v6.17 still copies every bio vector to offset
-zero — the fix was posted in November 2025 and is not in v6.17. Verify whether
-the tree you move to contains `offset += bvec.bv_len` before dropping 0001.
+**6.14 — `BLK_MQ_F_SHOULD_MERGE`** was removed. Merging is the default and the
+flags argument to `blk_mq_alloc_sq_tag_set()` is now `0`.
+
+**7.x — `kzalloc_flex()`.** 7.x added the `kmalloc_obj()` / `kzalloc_objs()` /
+`kzalloc_flex()` family, and upstream `ps3disk` allocates its fixed-size `priv`
+with `kzalloc_obj(*priv)`. Here `priv` carries a flexible array member of per
+region state, so the spelling is `kzalloc_flex(*priv, disk, dev->num_regions)`,
+which also gets `__counted_by()` checking on the count.
+
+That line is the only difference between the 6.18 LTS and 7.1.8 forms of this
+patch. Targeting 6.18 instead makes it
+`kzalloc(struct_size(priv, disk, dev->num_regions), GFP_KERNEL)` and leaves
+everything else identical.
+
+Nothing else in the patch depended on block-layer API that has moved.
+`set_disk_ro()`, `device_add_disk()`, `del_gendisk()`, `put_disk()` and
+`bitmap_find_next_zero_area()` are unchanged.
+
+The bounce buffer offset fix this repository carried as patch 0001 is upstream
+as of 6.19, backported to 6.18.44, 6.12.103 and 6.6.151, and present in 7.1.8
+at line 95 of a pristine `drivers/block/ps3disk.c`. It is retired rather than
+rebased. `kernel-patch.sh` greps for it and refuses to go on without it, since
+on a tree that has it the old patch would fail noisily and on a tree that lacks
+it the corruption is silent.
 
 ## What was and was not verified
 
-The patch was generated with `diff -u` against the pristine `v6.4` tag from
-`git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git`, with patch 0001
-applied first. Both patches apply to that tarball with no fuzz and produce
-byte-identical output to the intended source.
+The patch was generated with `diff -u` against pristine 7.1.8, unpacked from
+`linux-7.1.tar.xz` with `patch-7.1.8.xz` applied. The 7.1.8 stable patch does
+not touch `drivers/block/ps3disk.c`, so the tarball copy is the pristine 7.1.8
+copy. It applies with no fuzz and no rejects.
 
-Verified here:
+Verified on 7.1.8, by building it:
 
-- **Compiles clean.** `linux-6.4` + both patches, `ARCH=powerpc
-  CROSS_COMPILE=powerpc64-linux-gnu-`, `ps3_defconfig` (`CONFIG_PPC64=y`,
-  `CONFIG_CPU_BIG_ENDIAN=y`, `CONFIG_PS3_DISK=y`), gcc 11.2. Building
+- **Compiles clean.** `ARCH=powerpc CROSS_COMPILE=powerpc64-linux-gnu-`, gcc
+  11.4.0, `ps3_defconfig` (`CONFIG_PPC64=y`, `CONFIG_CPU_BIG_ENDIAN=y`,
+  `CONFIG_PS3_DISK=y`) plus `kernel-config.sh`. Building
   `drivers/block/ps3disk.o` at `W=1` produces no warnings, and the full
-  `vmlinux` links — `ELF 64-bit MSB executable, 64-bit PowerPC, Power ELF V1
-  ABI`, with `ps3disk_probe`, `ps3disk_queue_rq`, `ps3disk_interrupt` and
-  `ps3disk_remove` present in `System.map`.
-- **Module parameters register correctly**, checked in `.modinfo`:
-  `regions:ulong`, `writable:ulong`, `otheros_rw:bool`.
-- **`checkpatch.pl --strict`**: 0 errors, 0 warnings, 3 checks — see below.
-- **The blk-mq claims** above were checked against the 6.4 source rather than
-  recalled: `hctx->tags = set->tags[hctx_idx]` in `blk_mq_init_hctx()` and
-  `blk_mq_map_swqueue()`; `__blk_mq_alloc_disk()` passing `queuedata` through
-  to the queue; `__blk_mq_requeue_request()` resetting a started request;
-  `device_add_disk()` scanning partitions with `FMODE_READ`, so read-only
-  disks still get partition nodes.
+  `vmlinux` links with no errors — `ELF 64-bit MSB executable, 64-bit
+  PowerPC` — with `ps3disk_probe`, `ps3disk_queue_rq`, `ps3disk_interrupt` and
+  `ps3disk_remove` in `System.map`.
+- **The image is big-endian ELF ABI V2**, where the 6.4 build was V1.
+  `PPC64_BIG_ENDIAN_ELF_ABI_V2` is `def_bool y` and `ps3_defconfig` does not
+  override it. Kconfig describes it as an internal kernel ABI that does not
+  affect userspace, so the ELFv1 Debian userland should be unaffected — but it
+  is a difference from the image that booted, and nothing has kexec'd it.
+- **`kernelrelease` is `7.1.8`**, with `CONFIG_LOCALVERSION_AUTO` off and no
+  suffix of its own.
+- **Size.** Stripped `vmlinux` is 20.5 MiB, against roughly 19 MiB for the 6.4
+  build; about 210 MB unstripped. Four years of kernel growth costs on the
+  order of 1.5 MiB stripped, which the console's 256 MB absorbs.
+- **`checkpatch.pl --strict`**: 1 error, 0 warnings, 2 checks — see below.
 
-Verified on the console — see [Verified on hardware](#verified-on-hardware) for
-the output. Booted first time on a CECH-2503B: region 3 detected as the OtherOS
-region, the other three read-only, names matching petitboot, root mounted by
-label, and the busy backstop never firing.
+Inherited from the 6.4 work and *not* re-derived on 7.1.8:
+
+- **The blk-mq claims** in
+  [The mechanism: one tag set, queue depth one](#the-mechanism-one-tag-set-queue-depth-one)
+  were checked against the 6.4 source: `hctx->tags = set->tags[hctx_idx]` in
+  `blk_mq_init_hctx()` and `blk_mq_map_swqueue()`; `__blk_mq_alloc_disk()`
+  passing `queuedata` through to the queue; `__blk_mq_requeue_request()`
+  resetting a started request; `device_add_disk()` scanning partitions with
+  `FMODE_READ`, so read-only disks still get partition nodes. They were not
+  re-read in 7.1.8. A check against a more recent tree found `hctx_may_queue()`
+  still short-circuiting at depth 1 and `blk_mq_alloc_sq_tag_set()` unchanged,
+  but that is second-hand. Treat the serialisation argument as inherited, not
+  fresh.
+- **Module parameters** were checked in `.modinfo` on 6.4: `regions:ulong`,
+  `writable:ulong`, `otheros_rw:bool`. They compile and register on 7.1.8, but
+  none has been exercised at runtime on any kernel.
+
+Verified on the console **on 6.4**, with the two-patch series as it stood then
+— see [Verified on hardware](#verified-on-hardware) for the output. Booted
+first time on a CECH-2503B: region 3 detected as the OtherOS region, the other
+three read-only, names matching petitboot, root mounted by label, and the busy
+backstop never firing.
+
+**Nothing on 7.1.8 has booted.** No kexec, no console, no hardware of any kind.
+The 6.4 result above does not transfer: different kernel, different form of
+this patch. All the bring-up risk stands, and so does everything below.
 
 Still not verified, and worth stating:
 
@@ -703,21 +756,26 @@ Still not verified, and worth stating:
 
 ## checkpatch
 
-`checkpatch.pl --strict --patch` reports:
+`checkpatch.pl --strict` reports:
 
 ```
-total: 0 errors, 0 warnings, 3 checks, 518 lines checked
+total: 1 errors, 0 warnings, 2 checks, 524 lines checked
 ```
 
-The three `CHECK`s are all `spaces preferred around that ...`:
+The error is a missing `Signed-off-by:`, which matches existing practice for
+the out-of-tree patches here.
+
+The two `CHECK`s are both `spaces preferred around that ...`:
 
 ```c
-blk_queue_dma_alignment(queue, dev->blk_size-1);
 snprintf(..., PS3DISK_NAME, rp->devidx+'a');
 set_capacity(gendisk, region->size*priv->blocking_factor);
 ```
 
-All three are upstream lines moved from `ps3disk_probe()` into
+There were three on 6.4. `blk_queue_dma_alignment(queue, dev->blk_size-1)` was
+the third, and the `queue_limits` conversion removed the line.
+
+Both are upstream lines moved from `ps3disk_probe()` into
 `ps3disk_add_region()` with their spacing unchanged. checkpatch flags them
 because they appear as added lines. They are kept as they are so the moved
 code stays textually identical to what it replaced, which keeps future rebases
@@ -729,7 +787,7 @@ patch that is already large.
 - **T2 SDE**, `architecture/powerpc64/package/linux/0010-ps3stor-multiple-regions.patch`,
   for establishing that the right answer is one block device per accessible
   region rather than a better choice of single region.
-- **René Rebe** for the bounce buffer offset fix carried as patch 0001, and
-  Christoph Hellwig for reviewing it.
+- **René Rebe** for the bounce buffer offset fix, carried here as patch 0001
+  until it went upstream in 6.19, and Christoph Hellwig for reviewing it.
 
 Both drivers are GPL-2.0.

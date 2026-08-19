@@ -13,6 +13,64 @@ conclude from them). Where I could not determine something, it is in
 
 ---
 
+## Status: partly superseded, 2026-08-19
+
+The port has since been done, onto **7.1.8** rather than the 6.18 LTS §4.2
+recommended. `patches/0001`, `kernel-patch.sh` and `kernel-config.sh` are now
+built against 7.1.8 and a cross-build has been run. Where this report and that
+build disagree, the build wins. The rest of the file is left as written on
+2026-08-18.
+
+Settled:
+
+- **§5.1 is complete**, except the clone retarget. That is done for the manual
+  route in `README.md`, which now takes a kernel.org tarball, but *not* for
+  `scripts/make-debian-installer.sh`, which still clones Levand's `master` at
+  6.4. The two routes now build different kernels.
+- **"Whether the target builds" is answered.** `drivers/block/ps3disk.o`
+  compiles at `W=1` with no warnings and the full `vmlinux` links with no
+  errors — gcc 11.4.0, `ps3_defconfig` plus `kernel-config.sh`.
+  `kernelrelease` is a bare `7.1.8`.
+- **The `.config` after `olddefconfig` is known.** It was run. Every symbol the
+  script asks for ends up built in, with one casualty: `PROC_PID_CPUSET` now
+  depends on the deprecated `CPUSETS_V1`, which defaults to `n`, so it is
+  dropped rather than propped up.
+- **The size budget fits.** Stripped `vmlinux` is 20.5 MiB against roughly 19
+  MiB on 6.4; about 210 MB unstripped. This was the one result that could have
+  invalidated the target before touching hardware, and it does not.
+- **§0.3's tag bisection is superseded** by reading the shipped source:
+  `offset += bvec.bv_len` is at line 95 of a pristine 7.1.8
+  `drivers/block/ps3disk.c`. The missing commit hash is now irrelevant.
+- **§2.4's `platforms/cell` worry is closed.** `spu_base.o` and
+  `spufs/built-in.a` compile.
+
+Corrected:
+
+- **§1.4(a)** says to build `lim` inside `ps3disk_add_region()` *and use
+  `BOUNCE_SIZE`*. The shipped patch does the first but names `dev->bounce_size`
+  directly, which is valid there because `ps3disk_probe()` assigns it before the
+  region loop runs. That is the point of keeping the initialiser per region: the
+  ordering hazard Geert Uytterhoeven fixed upstream cannot recur.
+- **§1.4(c)** calls the `kzalloc_flex()` switch cosmetic and optional. It is
+  neither, on 7.x: the shipped patch uses
+  `kzalloc_flex(*priv, disk, dev->num_regions)`, and that single line is the
+  only difference between the 6.18 LTS and 7.1.8 forms of the patch.
+- **One difference no section anticipated:** the 7.1.8 image is big-endian ELF
+  ABI **V2**, where the 6.4 build was V1. `PPC64_BIG_ENDIAN_ELF_ABI_V2` is
+  `def_bool y` and `ps3_defconfig` does not override it. Kconfig describes it as
+  an internal kernel ABI that does not affect userspace.
+
+Not settled:
+
+- **Nothing has booted.** "Whether it boots" stands exactly as written. No
+  kexec, no console, no hardware.
+- **§1.2's serialisation argument was not re-derived** from 7.1.8 sources.
+  Treat it as inherited, not fresh.
+- **§5.2 and §5.3 stand**, as does the rootfs and `/lib/modules` coupling: a
+  kernel change invalidates the existing rootfs, and nothing here addresses it.
+
+---
+
 ## 0. The facts, established first
 
 ### 0.1 What mainline actually is

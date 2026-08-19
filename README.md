@@ -1,11 +1,11 @@
 # Debian on the internal drive of a PS3
 
 Patches, scripts and notes for running Debian sid ppc64 from the internal drive
-of a PS3 under OtherOS++, on a 6.4 kernel, alongside a working GameOS install.
+of a PS3 under OtherOS++, on a 7.1.8 kernel, alongside a working GameOS install.
 Existing guides for modern kernels put the root filesystem on external USB,
-which sidesteps two bugs in the PS3 storage path. Both are fixed here, so
-Debian boots from the OtherOS region, every region the hypervisor exposes is
-visible, and the GameOS regions are read-only.
+which sidesteps two bugs in the PS3 storage path. One is now fixed upstream and
+the other is fixed here, so Debian boots from the OtherOS region, every region
+the hypervisor exposes is visible, and the GameOS regions are read-only.
 
 One script does the host side: [The easy way](#the-easy-way). The numbered
 steps after it are reference.
@@ -23,7 +23,7 @@ steps after it are reference.
 | Console | A PS3 running OtherOS++ capable CFW. Verified on a Slim CECH-2503B with Evilnat 4.93 Cobra 8.5 CEX |
 | Bootloader | Petitboot in VFLASH, and an OtherOS region already created with glevand's `create_hdd_region.sh` |
 | Drive | Any internal drive. Verified on a Kingston SA400S37960G, 960 GB |
-| Kernel source | Geoff Levand's `ps3-linux` tree at 6.4 |
+| Kernel source | Linux 7.1.8 from kernel.org |
 | Host machine | Linux with `gcc-powerpc64-linux-gnu`, `debootstrap`, `qemu-user-static`, `binfmt-support`, `e2fsprogs` |
 | Transfer | A USB stick, to carry the image and scripts to petitboot |
 
@@ -148,10 +148,24 @@ PasswordAuthentication no
 **1. Get the kernel source.** *(once)*
 
 ```
-git clone https://git.kernel.org/pub/scm/linux/kernel/git/geoff/ps3-linux.git ~/ps3-linux
+cd ~
+curl -O https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.1.tar.xz
+curl -O https://cdn.kernel.org/pub/linux/kernel/v7.x/patch-7.1.8.xz
+tar xf linux-7.1.tar.xz
+mv linux-7.1 ps3-linux
+xzcat patch-7.1.8.xz | patch -d ps3-linux -p1
 ```
 
-**2. Apply both patches.** *(once)*
+Mainline, not Geoff Levand's `ps3-linux` tree. The platform support the console
+needs is upstream and maintained there, and that tree's `master` stopped at 6.4,
+which the patch below no longer applies to.
+
+`scripts/make-debian-installer.sh` has not followed. It still clones the 6.4
+tree, so the scripted route and this one now build different kernels.
+Retargeting it is a decision to move the project onto mainline rather than a
+change of URL, and it has not been built or booted.
+
+**2. Apply the patch.** *(once)*
 
 ```
 ./scripts/kernel-patch.sh ~/ps3-linux
@@ -160,18 +174,23 @@ git clone https://git.kernel.org/pub/scm/linux/kernel/git/geoff/ps3-linux.git ~/
 The script prints the patched code back so you can see it landed. It also fails
 if `drivers/ps3/ps3stor_lib.c` still carries the withdrawn v1 hack.
 
-**On a newer kernel, `0001` may do nothing.** René Rebe's bounce buffer fix was
-posted upstream in November 2025. It is absent at `v6.17`, so anything from
-roughly 6.18 onward already carries it. Check before applying it:
+**The bounce buffer fix is upstream, and is checked for rather than applied.**
+René Rebe's fix landed in 6.19 and was backported to 6.18.44, 6.12.103 and
+6.6.151. 7.1.8 carries it, so the patch this repository used to ship as `0001`
+is retired. `kernel-patch.sh` greps for the line instead:
 
 ```
 grep -n 'offset += bvec.bv_len' drivers/block/ps3disk.c
 ```
 
-Nothing back means the tree needs `0001`. `kernel-patch.sh` runs the same test
-and skips the patch when the line is already there, reporting
-`0001 bounce buffer offset: already applied`. `0002` is not upstream and is
-always needed.
+Nothing back means the tree predates the fix, and `kernel-patch.sh` stops there
+rather than going on. That is deliberate: on a tree that has the fix the old
+patch would fail noisily and waste time, and on a tree that lacks it every
+multi-segment transfer is silently corrupt and surfaces days later as
+filesystem damage. Either way the tree has to be looked at. Use 7.1.8, or
+6.18.44 or newer, or 6.12.103, or 6.6.151; the withdrawn patch is on the
+`v2.0-6.4` tag of this repository if you must stay lower. `0001`, the region
+patch, is not upstream and is always needed.
 
 **3. Configure and build the kernel.** *(once)*
 
@@ -207,8 +226,9 @@ sudo cp ~/ps3-linux/.config /srv/ps3root/boot/config-<kernel release>
 sudo chroot /srv/ps3root mkinitramfs -o /boot/initrd.img <kernel release>
 ```
 
-The strip is not optional. Unstripped `vmlinux` is about 143 MB; stripped it is
-about 19 MB.
+The strip is not optional. Unstripped `vmlinux` is about 210 MB on 7.1.8;
+stripped it is about 20.5 MiB. The 6.4 build was about 143 MB and 19 MiB, so
+the growth is around 1.5 MiB of kernel that has to be kexec'd.
 
 This is the only step that puts a kernel into the tree. Re-run it whenever you
 rebuild the kernel, before step 5, or the image will carry the previous one.
@@ -219,14 +239,16 @@ directory under `/lib/modules` exactly, which is what turning
 `CONFIG_LOCALVERSION_AUTO` off in step 3 is protecting: a mismatch means
 `mkinitramfs` builds an initrd with no modules in it.
 
-Copy it verbatim, including any trailing `+` — that character is part of the
-directory name, and `6.4.0+` and `6.4.0` are different directories.
+From the tarball in step 1 the string is a bare `7.1.8`, with no trailing `+`.
+That character came from `CONFIG_LOCALVERSION_AUTO` marking a git tree whose
+HEAD was not on an exact tag, and an unpacked tarball is not a git tree. If you
+do build from git and get one, copy it verbatim: it is part of the directory
+name, and `7.1.8+` and `7.1.8` are different directories.
 
 Do not copy a release string out of this document. What you get depends on the
 tree: `kernel-config.sh` turns `CONFIG_LOCALVERSION_AUTO` off and sets no
-suffix of its own, so a fresh clone gives a bare `6.4.0+`, while a tree built
-before under different settings may give something longer. Read it from the
-tree:
+suffix of its own, so the tarball gives `7.1.8`, while a tree built before
+under different settings may give something longer. Read it from the tree:
 
 ```
 make -s -C ~/ps3-linux ARCH=powerpc CROSS_COMPILE=powerpc64-linux-gnu- kernelrelease
@@ -247,8 +269,10 @@ The initrd is also why the emergency shell has a keyboard. `mkinitramfs` did
 not pull USB HID or the host controllers in, so `kernel-config.sh` builds them
 into the kernel instead.
 
-Watch the total size. About 19 MB of `vmlinux` plus about 15 MB of initrd is
-34 MB that petitboot has to kexec into 256 MB of RAM, alongside itself.
+Watch the total size. About 20.5 MiB of `vmlinux` plus about 15 MB of initrd
+is roughly 36 MB that petitboot has to kexec into 256 MB of RAM, alongside
+itself. The initrd figure is the 6.4 measurement; it has not been rebuilt for
+7.1.8.
 
 **5. Build the image.** *(rebuild loop)*
 
@@ -269,7 +293,7 @@ cleanly and contained an almost empty `/usr` — one directory in it. It fails a
 `run-init` rather than at build time.
 
 Build on the host, not on the console: petitboot's `mke2fs` is from 2010 and
-writes group descriptors the 6.4 ext4 driver rejects outright.
+writes group descriptors the 7.1.8 ext4 driver rejects outright.
 
 1048576 blocks of 4 KiB is 4 GiB. The region holds 18 GiB, but 4 is enough —
 the tree is around 721 MB and the finished filesystem uses 875 MB — and it
@@ -393,13 +417,19 @@ What has actually run on hardware:
 
 | | |
 |---|---|
-| `patches/0001`, `patches/0002` | Booted. Region detection, write protection, naming, concurrent reads across three regions — all confirmed, see [docs/region-handling.md](docs/region-handling.md#verified-on-hardware) |
+| `patches/0001`, `patches/0002` as they stood on 6.4 | Booted. Region detection, write protection, naming, concurrent reads across three regions — all confirmed, see [docs/region-handling.md](docs/region-handling.md#verified-on-hardware) |
 | `61-ps3-persistent-storage.rules` | Confirmed: `/dev/disk/by-label` populated, `blkid` working |
 | `kernel-patch.sh`, `kernel-config.sh` | Run. Produced the kernel that boots |
 | `build-image.sh`, `partition-region.sh` | Run. Produced the image and partition table now on the console |
 | `write-image.sh` | Run. Wrote and verified the image now on the console |
 | `build-rootfs.sh` | Run. Built the tree that boots |
 | `make-debian-installer.sh` | **Not run end to end.** Written after the dry run. Its state detection, progress polling, removable-device scan and menus are tested; a full run through it is not. It calls the scripts above rather than reimplementing them, so the steps it drives are verified |
+
+That first row is the 6.4 build, with the two-patch series as it stood then.
+The 7.1.8 rebase in `patches/0001` compiles clean at `W=1` and applies to a
+pristine tree with no fuzz, but nothing on 7.1.8 has booted — no kexec, no
+console, no hardware of any kind. The hardware results here, and the numbers
+below, are the 6.4 run's.
 
 **Every script in this repository has run on hardware, in the order above.** A
 full dry run went from a clean machine to booting Debian: a fresh tree at
@@ -417,9 +447,11 @@ Numbers from that run:
 | gzipped image on the stick | 337 MB |
 | kernel release | `6.4.0-g98ec4e7cee0f+` — that tree's value, not a target |
 
-The kernel release above is what that particular tree produced; it carried a
-`.scmversion` from an early build. A clean clone gives `6.4.0+`. Read yours
-with `make -s kernelrelease` rather than expecting either.
+Those are the 6.4 run's figures. The kernel release is what that particular
+tree produced; it carried a `.scmversion` from an early build, and a clean
+clone of it gave `6.4.0+`. The 7.1.8 tarball build gives a bare `7.1.8` —
+built here, not booted. Read yours with `make -s kernelrelease` rather than
+expecting any of them.
 
 The tree is 721 MB rather than the 1.4 GB quoted in earlier notes because
 `build-rootfs.sh` now runs `apt-get clean`. The earlier tree carried every
@@ -439,12 +471,13 @@ all but the first.
 Single-segment requests are fine, so the superblock reads correctly and
 anything larger returns repeated data. It presents as ext4 group descriptor
 errors, binaries that exist but will not execute, and a different errno on each
-boot, since request segmentation varies between boots. `patches/0001` restores
-the line.
+boot, since request segmentation varies between boots.
 
-Petitboot is unaffected: 2.6.30 predates the refactor. Upstream `ps3disk.c` at
-`v6.17` still has this bug — the fix postdates that release, so check for
-`offset += bvec.bv_len` in whatever tree you move to.
+Petitboot is unaffected: 2.6.30 predates the refactor. This repository carried
+the fix as `patches/0001` while it was out of tree; René Rebe's version landed
+upstream in 6.19 and was backported to 6.18.44, 6.12.103 and 6.6.151, so on
+7.1.8 there is nothing left to apply and `kernel-patch.sh` checks for the line
+rather than restoring it.
 
 ### Bug 2: region selection
 
@@ -454,7 +487,7 @@ rather than the OtherOS region. Under Sony's original OtherOS the hypervisor
 exposed one region and there was nothing to choose between; CFW exposes them
 all.
 
-`patches/0002` gives each accessible region its own block device instead of
+`patches/0001` gives each accessible region its own block device instead of
 choosing between them, matching petitboot:
 
 | Device | Region | Contents | Default |
@@ -504,20 +537,20 @@ the rest in order.
 | Document | |
 |---|---|
 | [docs/migration.md](docs/migration.md) | v1 to v2: `ps3da` becomes `ps3dd`. Read before rebuilding. |
-| [docs/region-handling.md](docs/region-handling.md) | Why `patches/0002` is built the way it is, and what was verified. |
+| [docs/region-handling.md](docs/region-handling.md) | Why `patches/0001` is built the way it is, and what was verified. |
 | [docs/kernel-config.md](docs/kernel-config.md) | Config options beyond `ps3_defconfig`, and why each is needed. |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptoms and causes, in the order they appear during a build. |
 
 ## Credit
 
-Written by setsid. `patches/0002`, the documentation and the scripts are mine;
+Written by setsid. `patches/0001`, the documentation and the scripts are mine;
 the work below is other people's.
 
 - René Rebe for the `ps3disk` offset fix, and Christoph Hellwig for reviewing it
 - T2 SDE for
   `architecture/powerpc64/package/linux/0010-ps3stor-multiple-regions.patch`,
   which established that the answer is one block device per accessible region
-  rather than a better choice of single region. `patches/0002` takes that idea
+  rather than a better choice of single region. `patches/0001` takes that idea
   and differs in the details — see `docs/region-handling.md`
 - Geoff Levand for the PS3 kernel tree
 - glevand for `create_hdd_region.sh` and the OtherOS tools
