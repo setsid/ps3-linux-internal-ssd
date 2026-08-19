@@ -1,5 +1,5 @@
 From: setsid <13945393+setsid@users.noreply.github.com>
-Subject: [PATCH 2/2] ps3disk: expose every accessible storage region
+Subject: [PATCH] ps3disk: expose every accessible storage region
 
 The PS3 hypervisor divides the internal drive into regions and reports
 which of them the guest LPAR may reach. Under Sony's OtherOS that was
@@ -73,18 +73,44 @@ read-only, and in staying inside ps3disk.c: ps3disk computes its region id
 locally and never calls ps3stor_read_write_sectors(), so asm/ps3stor.h,
 ps3stor_lib.c, ps3rom and ps3flash need no change.
 
-Applies on top of René Rebe's bounce buffer offset fix, patch 0001 in this
-series, which is required for any multi-segment transfer to be correct.
+The bounce buffer offset fix this series previously carried as patch 0001
+is upstream as of 6.19 and backported to 6.18.44, 6.12.103 and 6.6.151, so
+it is no longer part of this series. On a kernel older than those it is
+still required for any multi-segment transfer to be correct.
 
 Not upstream. Region 0 is only reachable on custom firmware, and the
 read-only policy is specific to the OtherOS++ layout.
 
-Based on Linux 6.4.
+Based on Linux 7.1.8.
+
+Rebased from 6.4. Three changes since then:
+
+  - The blk_queue_*() setters were replaced by a queue_limits structure
+    passed to blk_mq_alloc_disk(). The initialiser lives in
+    ps3disk_add_region() rather than in ps3disk_probe(), because probe()
+    assigns dev->bounce_size before any region is added. Upstream's own
+    conversion of this driver put the initialiser in probe() and read
+    dev->bounce_size one line before it was assigned, which Geert
+    Uytterhoeven fixed in January 2025; placing it per region means the
+    limits can name dev->bounce_size directly and the ordering hazard
+    cannot recur.
+
+  - BLK_MQ_F_SHOULD_MERGE was removed; merging is the default and the flag
+    argument to blk_mq_alloc_sq_tag_set() is now 0.
+
+  - 7.x added the kmalloc_obj()/kzalloc_flex() helper family. priv gained a
+    flexible array member of per region state, so the allocation is
+    kzalloc_flex(*priv, disk, dev->num_regions) rather than the
+    kzalloc_obj(*priv) upstream now uses for the fixed size struct. This
+    also gets __counted_by() checking on the count.
+
+BLK_FEAT_ROTATIONAL is carried in the limits to match what the driver did
+before the conversion, when queues were rotational by default.
 
 SPDX-License-Identifier: GPL-2.0
 ---
- drivers/block/ps3disk.c | 398 ++++++++++++++++++++++++++++++++++++++++++++++++------------
- 1 file changed, 320 insertions(+), 78 deletions(-)
+ drivers/block/ps3disk.c | 394 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 322 insertions(+), 72 deletions(-)
 
 --- a/drivers/block/ps3disk.c
 +++ b/drivers/block/ps3disk.c
@@ -153,7 +179,7 @@ SPDX-License-Identifier: GPL-2.0
  
  static const struct block_device_operations ps3disk_fops = {
  	.owner		= THIS_MODULE,
-@@ -95,13 +127,14 @@
+@@ -97,13 +129,14 @@
  }
  
  static blk_status_t ps3disk_submit_request_sg(struct ps3_storage_device *dev,
@@ -169,7 +195,7 @@ SPDX-License-Identifier: GPL-2.0
  
  #ifdef DEBUG
  	unsigned int n = 0;
-@@ -163,6 +196,7 @@
+@@ -165,6 +198,7 @@
  }
  
  static blk_status_t ps3disk_do_request(struct ps3_storage_device *dev,
@@ -177,7 +203,7 @@ SPDX-License-Identifier: GPL-2.0
  				       struct request *req)
  {
  	dev_dbg(&dev->sbd.core, "%s:%u\n", __func__, __LINE__);
-@@ -172,7 +206,7 @@
+@@ -174,7 +208,7 @@
  		return ps3disk_submit_flush_request(dev, req);
  	case REQ_OP_READ:
  	case REQ_OP_WRITE:
@@ -186,7 +212,7 @@ SPDX-License-Identifier: GPL-2.0
  	default:
  		blk_dump_rq_flags(req, DEVICE_NAME " bad request");
  		return BLK_STS_IOERR;
-@@ -183,14 +217,34 @@
+@@ -185,14 +219,34 @@
  				     const struct blk_mq_queue_data *bd)
  {
  	struct request_queue *q = hctx->queue;
@@ -224,7 +250,7 @@ SPDX-License-Identifier: GPL-2.0
  	spin_unlock_irq(&priv->lock);
  
  	return ret;
-@@ -202,6 +256,7 @@
+@@ -204,6 +258,7 @@
  	struct ps3disk_private *priv;
  	struct request *req;
  	int res, read;
@@ -232,7 +258,7 @@ SPDX-License-Identifier: GPL-2.0
  	blk_status_t error;
  	u64 tag, status;
  	const char *op;
-@@ -254,7 +309,12 @@
+@@ -256,7 +311,12 @@
  	blk_mq_end_request(req, error);
  	spin_unlock(&priv->lock);
  
@@ -246,7 +272,7 @@ SPDX-License-Identifier: GPL-2.0
  	return IRQ_HANDLED;
  }
  
-@@ -370,6 +430,53 @@
+@@ -372,6 +432,53 @@
  	return 0;
  }
  
@@ -300,42 +326,54 @@ SPDX-License-Identifier: GPL-2.0
  static unsigned long ps3disk_mask;
  
  static DEFINE_MUTEX(ps3disk_mask_mutex);
-@@ -378,14 +485,113 @@
+@@ -380,22 +487,118 @@
  	.queue_rq	= ps3disk_queue_rq,
  };
  
+-static int ps3disk_probe(struct ps3_system_bus_device *_dev)
 +static int ps3disk_add_region(struct ps3_storage_device *dev,
 +			      struct ps3disk_private *priv, unsigned int idx,
 +			      bool writable)
-+{
+ {
+-	struct ps3_storage_device *dev = to_ps3_storage_device(&_dev->core);
+-	struct ps3disk_private *priv;
 +	struct ps3_storage_region *region = &dev->regions[idx];
 +	struct ps3disk_region_priv *rp = &priv->disk[priv->num_disks];
-+	struct request_queue *queue;
 +	struct gendisk *gendisk;
-+	int error;
+ 	int error;
+-	unsigned int devidx;
++
++	/*
++	 * dev->bounce_size is assigned in ps3disk_probe() before any region is
++	 * added, so it is safe to read here.  Upstream's own queue_limits
++	 * conversion read it one line too early and had to be fixed; keeping
++	 * the initialiser in this function rather than in probe() avoids
++	 * reintroducing that ordering hazard.
++	 */
+ 	struct queue_limits lim = {
+ 		.logical_block_size	= dev->blk_size,
+-		.max_hw_sectors		= BOUNCE_SIZE >> 9,
++		.max_hw_sectors		= dev->bounce_size >> 9,
+ 		.max_segments		= -1,
+-		.max_segment_size	= BOUNCE_SIZE,
++		.max_segment_size	= dev->bounce_size,
+ 		.dma_alignment		= dev->blk_size - 1,
+ 		.features		= BLK_FEAT_WRITE_CACHE |
+ 					  BLK_FEAT_ROTATIONAL,
+ 	};
+-	struct gendisk *gendisk;
 +
 +	rp->dev = dev;
 +	rp->region_idx = idx;
 +	rp->devidx = priv->devidx_base + idx;
 +
-+	gendisk = blk_mq_alloc_disk(&priv->tag_set, rp);
++	gendisk = blk_mq_alloc_disk(&priv->tag_set, &lim, rp);
 +	if (IS_ERR(gendisk)) {
 +		dev_err(&dev->sbd.core,
 +			"%s:%u: blk_mq_alloc_disk failed for region %u\n",
 +			__func__, __LINE__, idx);
 +		return PTR_ERR(gendisk);
 +	}
-+
-+	queue = gendisk->queue;
-+
-+	blk_queue_max_hw_sectors(queue, dev->bounce_size >> 9);
-+	blk_queue_dma_alignment(queue, dev->blk_size-1);
-+	blk_queue_logical_block_size(queue, dev->blk_size);
-+
-+	blk_queue_write_cache(queue, true, false);
-+
-+	blk_queue_max_segments(queue, -1);
-+	blk_queue_max_segment_size(queue, dev->bounce_size);
 +
 +	rp->gendisk = gendisk;
 +	gendisk->major = ps3disk_major;
@@ -404,21 +442,17 @@ SPDX-License-Identifier: GPL-2.0
 + * state to keep consistent with priv->req.  The busy test in
 + * ps3disk_queue_rq() is kept only as a backstop.
 + */
- static int ps3disk_probe(struct ps3_system_bus_device *_dev)
- {
- 	struct ps3_storage_device *dev = to_ps3_storage_device(&_dev->core);
- 	struct ps3disk_private *priv;
--	int error;
--	unsigned int devidx;
--	struct request_queue *queue;
--	struct gendisk *gendisk;
++static int ps3disk_probe(struct ps3_system_bus_device *_dev)
++{
++	struct ps3_storage_device *dev = to_ps3_storage_device(&_dev->core);
++	struct ps3disk_private *priv;
 +	unsigned long exposed, writable;
 +	unsigned int devidx, span, i;
 +	int otheros, error;
  
  	if (dev->blk_size < 512) {
  		dev_err(&dev->sbd.core,
-@@ -394,26 +600,22 @@
+@@ -404,26 +607,22 @@
  		return -EINVAL;
  	}
  
@@ -439,14 +473,14 @@ SPDX-License-Identifier: GPL-2.0
 -	__set_bit(devidx, &ps3disk_mask);
 -	mutex_unlock(&ps3disk_mask_mutex);
  
--	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+-	priv = kzalloc_obj(*priv);
 -	if (!priv) {
 -		error = -ENOMEM;
 -		goto fail;
 -	}
 +	BUILD_BUG_ON(PS3DISK_MAX_DISKS > BITS_PER_LONG);
 +
-+	priv = kzalloc(struct_size(priv, disk, dev->num_regions), GFP_KERNEL);
++	priv = kzalloc_flex(*priv, disk, dev->num_regions);
 +	if (!priv)
 +		return -ENOMEM;
  
@@ -456,14 +490,13 @@ SPDX-License-Identifier: GPL-2.0
  
  	dev->bounce_size = BOUNCE_SIZE;
  	dev->bounce_buf = kmalloc(BOUNCE_SIZE, GFP_DMA);
-@@ -426,58 +628,95 @@
+@@ -436,46 +635,94 @@
  	if (error)
  		goto fail_free_bounce;
  
 -	ps3disk_identify(dev);
 -
--	error = blk_mq_alloc_sq_tag_set(&priv->tag_set, &ps3disk_mq_ops, 1,
--					BLK_MQ_F_SHOULD_MERGE);
+-	error = blk_mq_alloc_sq_tag_set(&priv->tag_set, &ps3disk_mq_ops, 1, 0);
 -	if (error)
 +	if (ps3disk_identify(dev))
 +		dev_warn(&dev->sbd.core,
@@ -480,7 +513,7 @@ SPDX-License-Identifier: GPL-2.0
 +		error = -ENODEV;
  		goto fail_teardown;
 -
--	gendisk = blk_mq_alloc_disk(&priv->tag_set, dev);
+-	gendisk = blk_mq_alloc_disk(&priv->tag_set, &lim, dev);
 -	if (IS_ERR(gendisk)) {
 -		dev_err(&dev->sbd.core, "%s:%u: blk_mq_alloc_disk failed\n",
 -			__func__, __LINE__);
@@ -488,12 +521,23 @@ SPDX-License-Identifier: GPL-2.0
 -		goto fail_free_tag_set;
  	}
  
--	queue = gendisk->queue;
+-	priv->gendisk = gendisk;
+-	gendisk->major = ps3disk_major;
+-	gendisk->first_minor = devidx * PS3DISK_MINORS;
+-	gendisk->minors = PS3DISK_MINORS;
+-	gendisk->fops = &ps3disk_fops;
+-	gendisk->private_data = dev;
+-	snprintf(gendisk->disk_name, sizeof(gendisk->disk_name), PS3DISK_NAME,
+-		 devidx+'a');
+-	priv->blocking_factor = dev->blk_size >> 9;
+-	set_capacity(gendisk,
+-		     dev->regions[dev->region_idx].size*priv->blocking_factor);
 +	otheros = ps3disk_find_otheros_region(dev, priv, exposed);
  
--	blk_queue_max_hw_sectors(queue, dev->bounce_size >> 9);
--	blk_queue_dma_alignment(queue, dev->blk_size-1);
--	blk_queue_logical_block_size(queue, dev->blk_size);
+-	dev_info(&dev->sbd.core,
+-		 "%s is a %s (%llu MiB total, %llu MiB for OtherOS)\n",
+-		 gendisk->disk_name, priv->model, priv->raw_capacity >> 11,
+-		 get_capacity(gendisk) >> 11);
 +	writable = ps3disk_writable_mask & exposed;
 +	if (otheros >= 0 && ps3disk_otheros_rw)
 +		writable |= BIT(otheros);
@@ -524,7 +568,7 @@ SPDX-License-Identifier: GPL-2.0
 +	 */
 +	span = __fls(exposed) + 1;
  
--	blk_queue_write_cache(queue, true, false);
+-	error = device_add_disk(&dev->sbd.core, gendisk, NULL);
 +	mutex_lock(&ps3disk_mask_mutex);
 +	devidx = bitmap_find_next_zero_area(&ps3disk_mask, PS3DISK_MAX_DISKS,
 +					    0, span, 0);
@@ -537,42 +581,22 @@ SPDX-License-Identifier: GPL-2.0
 +	}
 +	bitmap_set(&ps3disk_mask, devidx, span);
 +	mutex_unlock(&ps3disk_mask_mutex);
- 
--	blk_queue_max_segments(queue, -1);
--	blk_queue_max_segment_size(queue, dev->bounce_size);
++
 +	priv->devidx_base = devidx;
 +	priv->devidx_span = span;
- 
--	priv->gendisk = gendisk;
--	gendisk->major = ps3disk_major;
--	gendisk->first_minor = devidx * PS3DISK_MINORS;
--	gendisk->minors = PS3DISK_MINORS;
--	gendisk->fops = &ps3disk_fops;
--	gendisk->private_data = dev;
--	snprintf(gendisk->disk_name, sizeof(gendisk->disk_name), PS3DISK_NAME,
--		 devidx+'a');
--	priv->blocking_factor = dev->blk_size >> 9;
--	set_capacity(gendisk,
--		     dev->regions[dev->region_idx].size*priv->blocking_factor);
-+	error = blk_mq_alloc_sq_tag_set(&priv->tag_set, &ps3disk_mq_ops, 1,
-+					BLK_MQ_F_SHOULD_MERGE);
-+	if (error)
++
++	error = blk_mq_alloc_sq_tag_set(&priv->tag_set, &ps3disk_mq_ops, 1, 0);
+ 	if (error)
+-		goto fail_cleanup_disk;
 +		goto fail_free_devidx;
- 
--	dev_info(&dev->sbd.core,
--		 "%s is a %s (%llu MiB total, %llu MiB for OtherOS)\n",
--		 gendisk->disk_name, priv->model, priv->raw_capacity >> 11,
--		 get_capacity(gendisk) >> 11);
++
 +	for_each_set_bit(i, &exposed, dev->num_regions) {
 +		error = ps3disk_add_region(dev, priv, i,
 +					   test_bit(i, &writable));
 +		if (error)
 +			goto fail_del_disks;
 +	}
- 
--	error = device_add_disk(&dev->sbd.core, gendisk, NULL);
--	if (error)
--		goto fail_cleanup_disk;
++
 +	dev_info(&dev->sbd.core, "%s (%llu MiB total), %u of %u regions\n",
 +		 priv->model, priv->raw_capacity >> 11, priv->num_disks,
 +		 dev->num_regions);
@@ -592,7 +616,7 @@ SPDX-License-Identifier: GPL-2.0
  fail_teardown:
  	ps3stor_teardown(dev);
  fail_free_bounce:
-@@ -485,10 +724,6 @@
+@@ -483,10 +730,6 @@
  fail_free_priv:
  	kfree(priv);
  	ps3_system_bus_set_drvdata(_dev, NULL);
@@ -603,7 +627,7 @@ SPDX-License-Identifier: GPL-2.0
  	return error;
  }
  
-@@ -497,13 +732,20 @@
+@@ -495,13 +738,20 @@
  	struct ps3_storage_device *dev = to_ps3_storage_device(&_dev->core);
  	struct ps3disk_private *priv = ps3_system_bus_get_drvdata(&dev->sbd);
  

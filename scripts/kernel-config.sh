@@ -34,12 +34,19 @@ USB USB_EHCI_HCD USB_OHCI_HCD HID USB_HID
 
 # systemd will not start PID 1 without cgroup v2.
 CGROUPS MEMCG CGROUP_SCHED FAIR_GROUP_SCHED CGROUP_PIDS CGROUP_FREEZER
-CGROUP_DEVICE CGROUP_CPUACCT CGROUP_BPF CPUSETS PROC_PID_CPUSET BLK_CGROUP
+CGROUP_DEVICE CGROUP_CPUACCT CGROUP_BPF CPUSETS BLK_CGROUP
 
 # CGROUP_PERF is deliberately not here. It needs PERF_EVENTS, which
 # ps3_defconfig does not set, so the request could never be satisfied and did
 # nothing at all. systemd does not use the controller, and pulling perf
 # machinery into a 256 MB machine to satisfy it is not worth the kernel it adds.
+#
+# PROC_PID_CPUSET was here for 6.4 and is not here now. Since the cgroup v1
+# controllers were made separately configurable it depends on CPUSETS_V1, which
+# is deprecated and defaults to n, so asking for it on 6.13 or later fails the
+# check below. It only provides the legacy /proc/<pid>/cpuset file; systemd
+# drives cgroup v2, which CPUSETS alone still gives us. Enabling CPUSETS_V1 to
+# satisfy it would add v1 cpuset code for an interface nothing here reads.
 
 # Required for systemd-udevd, PrivateTmp= and most service sandboxing.
 NAMESPACES UTS_NS IPC_NS PID_NS NET_NS USER_NS
